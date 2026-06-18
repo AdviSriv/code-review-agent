@@ -5,13 +5,30 @@ import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from app.config import get_secret, get_repo_pat
+from app.config import get_secret
 from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
 from app.prompt_builder import build_system_instruction, chunk_file_diffs
-from app.llm_client import call_gemini, reset_tool_counter
+from app.llm_client import call_gemini, reset_telemetry_counters, token_stats  # <--- Updated Import
 from app.models import CodeReviewResponse
 from app.output_parser import parse_and_sort_comments, format_terminal_output, build_github_review_payload
 from app.repo_checks import get_repo_conventions, fetch_and_validate_commits
+
+def fetch_repo_metadata(owner: str, repo: str, token: str) -> dict:
+    """
+    Fetches core repository metadata (like size in KB).
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return {}
 
 def fetch_pr_metadata(owner: str, repo: str, pr_number: str, token: str) -> dict:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
@@ -45,7 +62,7 @@ def fetch_all_pr_files(owner: str, repo: str, pr_number: str, token: str) -> lis
         if len(data) < 100:
             break
         page += 1
-        if page > 10:  # Protect against massive, unexpected loops
+        if page > 10:
             break
     return all_files
 
@@ -71,12 +88,16 @@ def post_github_review(owner: str, repo: str, pr_number: str, token: str, commit
 def run_review_pipeline(repo_full_name: str, pr_number: str):
     print(f"\n[Worker] Starting review pipeline for {repo_full_name} PR #{pr_number}")
     try:
-        token = get_repo_pat(repo_full_name)
+        token = get_secret("GITHUB_PAT")
         if not token:
             print(f"[Worker] Error: No GITHUB_PAT mapped for '{repo_full_name}'. Execution aborted.")
             return
             
         owner, repo = repo_full_name.split("/")
+        
+        # Gather repository statistics (size / metadata)
+        repo_meta = fetch_repo_metadata(owner, repo, token)
+        repo_size_kb = repo_meta.get("size", 0)
         
         # 1. Inspect metadata for Draft PR status
         pr_data = fetch_pr_metadata(owner, repo, pr_number, token)
@@ -86,13 +107,13 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             
         commit_id = pr_data.get("head", {}).get("sha")
         
-        # Configure tool fallback variables
+        # Configure tool fallback variables and reset stats
         from app.llm_client import _context
         _context["owner"] = owner
         _context["repo"] = repo
         _context["token"] = token
         _context["commit_sha"] = commit_id
-        reset_tool_counter()
+        reset_telemetry_counters()
         
         # 2. Fetch modified PR files (handling pagination)
         pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
@@ -100,6 +121,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
         all_comments = []
         conventions = get_repo_conventions(owner, repo, token)
         system_inst = build_system_instruction(conventions)
+        
+        total_diff_lines = 0
         
         for f in pr_files:
             filename = f.get("filename")
@@ -110,15 +133,13 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
                 print(f"[Worker] Skipping filtered file: {filename}")
                 continue
                 
-            # Gracefully handle files lacking raw patch data (e.g. binaries, deleted files)
             if not patch:
                 print(f"[Worker] Skipping {filename} (no patch context available)")
                 continue
                 
+            total_diff_lines += len(patch.splitlines())
             lang = identify_language(filename)
             parsed_diff = parse_patch(patch)
-            
-            # Decompose into chunk scopes (individual hunks)
             chunks = chunk_file_diffs(filename, lang, parsed_diff)
             
             for chunk in chunks:
@@ -131,11 +152,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
                     
         # 3. Perform programmatic Zero-LLM commit conventions validation
         commit_suggestions = fetch_and_validate_commits(owner, repo, pr_number, token)
-        
-        # Map findings to GitHub payload comments
         gh_comments = build_github_review_payload(all_comments)
         
-        # Build batched review body
         summary_body = "### 🛡️ Automated Code Review Completed\n\nAll inline comments are batched and posted below."
         if commit_suggestions:
             summary_body += "\n\n### ⚠️ Commit Message Conventions Suggestions (Low Severity)\n"
@@ -155,6 +173,19 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             )
         else:
             print("[Worker] No review actions generated.")
+            
+        # Print Consolidated Performance metrics
+        print("\n================== PERFORMANCE METRICS ==================")
+        if repo_size_kb:
+            print(f"Repository size: {repo_size_kb:,} KB")
+        else:
+            print("Repository size: Unknown/Unavailable")
+        print(f"PR Diff size: {total_diff_lines:,} total lines processed")
+        print(f"Tokens consumed for evaluation:")
+        print(f"  - Input (Prompt) Tokens: {token_stats['prompt_tokens']:,}")
+        print(f"  - Output (Completion) Tokens: {token_stats['candidates_tokens']:,}")
+        print(f"  - Total Tokens consumed: {token_stats['total_tokens']:,}")
+        print("=========================================================\n")
             
     except Exception as e:
         print(f"[Worker] Pipeline crashed: {e}")
@@ -198,7 +229,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.send_response(202)
                 self.end_headers()
                 
-                # Execute pipeline inside an independent worker thread to prevent webhook timeout limits
                 thread = threading.Thread(
                     target=run_review_pipeline,
                     args=(repo_full_name, str(pr_number))
@@ -240,10 +270,13 @@ def main():
             print(f"Failed to read file: {e}")
             sys.exit(1)
             
+        reset_telemetry_counters()
         parsed_files = parse_full_diff(diff_text)
         all_comments = []
         conventions = get_repo_conventions()
         system_inst = build_system_instruction(conventions)
+        
+        total_diff_lines = len(diff_text.splitlines())
         
         for filepath, data in parsed_files.items():
             if is_ignored_file(filepath):
@@ -260,6 +293,17 @@ def main():
                     print(f"Error reviewing chunk: {e}")
                     
         format_terminal_output(all_comments)
+        
+        # Display telemetry panel for offline runs
+        print("\n================== PERFORMANCE METRICS ==================")
+        print("Repository size: N/A (offline local execution mode)")
+        print(f"PR Diff size: {total_diff_lines:,} total lines processed")
+        print(f"Tokens consumed for evaluation:")
+        print(f"  - Input (Prompt) Tokens: {token_stats['prompt_tokens']:,}")
+        print(f"  - Output (Completion) Tokens: {token_stats['candidates_tokens']:,}")
+        print(f"  - Total Tokens consumed: {token_stats['total_tokens']:,}")
+        print("=========================================================\n")
+        
     elif args.repo and args.pr:
         # Direct CLI execution
         run_review_pipeline(args.repo, args.pr)

@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from google import genai
 from google.genai import types
@@ -12,6 +13,12 @@ _context = {
 }
 
 get_lines_counter = 0
+
+token_stats = {
+    "prompt_tokens": 0,
+    "candidates_tokens": 0,
+    "total_tokens": 0
+}
 
 def get_lines(file: str, start: int, end: int) -> str:
     """
@@ -34,7 +41,7 @@ def get_lines(file: str, start: int, end: int) -> str:
         except Exception:
             pass
             
-    # 2. Remote fallback over API (if repository is not checked out locally on the VM)
+    # 2. Remote fallback over API
     owner = _context.get("owner")
     repo = _context.get("repo")
     token = _context.get("token")
@@ -59,9 +66,12 @@ def get_lines(file: str, start: int, end: int) -> str:
             
     return f"Error: File '{file}' not found locally or remote parameters missing."
 
-def reset_tool_counter():
+def reset_telemetry_counters():
     global get_lines_counter
     get_lines_counter = 0
+    token_stats["prompt_tokens"] = 0
+    token_stats["candidates_tokens"] = 0
+    token_stats["total_tokens"] = 0
 
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     api_key = get_secret("GEMINI_API_KEY")
@@ -69,23 +79,46 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         raise ValueError("GEMINI_API_KEY is not defined. Run `python -m app.config --set-gemini` to configure it.")
         
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("LLM_MODEL", "gemini-3.5-flash")
     
     config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=response_schema,
         temperature=0.1,
         system_instruction=system_instruction,
-        tools=[get_lines]  # Automatically configures tool calling pipeline
+        tools=[get_lines]
     )
     
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=config
-    )
+    # Retry engine parameters
+    max_retries = 3
+    retry_delay = 3  # Wait 3 seconds initially, doubling each attempt
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config
+            )
+            break
+        except Exception as e:
+            # Check for transient server issues (503) or rate limits (429)
+            error_str = str(e)
+            is_transient = "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            
+            if is_transient and attempt < max_retries - 1:
+                print(f"[LLM Client] Transient error encountered ({error_str.splitlines()[0]}). Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                # Re-raise the exception if the retry attempts are exhausted
+                raise e
     
     if not response.text:
         raise RuntimeError("LLM returned an empty response.")
+        
+    usage = response.usage_metadata
+    if usage:
+        token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
+        token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+        token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
         
     return response.text
