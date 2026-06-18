@@ -1,0 +1,357 @@
+diff --git a/app/diff_parser.py b/app/diff_parser.py
+index e69de29..583811b 100644
+--- a/app/diff_parser.py
++++ b/app/diff_parser.py
+@@ -0,0 +1,80 @@
++import re
++
++def parse_diff(diff_text: str)->dict:
++    """
++    Parses a unified git diff.
++    Returns a dictionary structured as:
++    {
++        "file_path": {
++            "added_lines": {line_num: content},
++            "context_lines": {line_num: content},
++            "line_to_position": {line_num: diff_position}
++        }
++    }
++    """
++
++    files = {}
++    lines = diff_text.splitlines()
++
++    current_file = None
++    diff_position = 0
++    new_line_num = 0
++    first_hunk_seen = False
++
++    i=0
++    while i<len(lines):
++        line = lines[i]
++
++        if line.startswith('diff --git'):
++            current_file = None
++            diff_position = 0
++            first_hunk_seen = False
++
++            while i<len(lines) and not lines[i].startswith('@@'):
++                if lines[i].startswith('+++ b/'):
++                    current_file = lines[i][6:]
++                i += 1
++            
++            if current_file:
++                files[current_file] = {'added_lines':{}, 'context_lines': {}, 'line_to_position': {}}
++            continue
++
++        if current_file and line.startswith('@@'):
++            try:
++                parts = line.split(' ')
++                new_info = parts[2]
++                if ',' in new_info:
++                    new_line_num = int(new_info.split(',')[0][1:])
++                else:
++                    new_line_num = int(new_info[1:])
++            except Exception:
++                pass
++
++            if not first_hunk_seen:
++                first_hunk_seen = True
++                diff_position = 0
++            else:
++                diff_position += 1
++            
++        elif current_file and first_hunk_seen:
++            diff_position += 1
++            if line.startswith('+'):
++                content = line[1:]
++                files[current_file]['added_lines'][new_line_num] = content
++                files[current_file]['line_to_position'][new_line_num] = diff_position
++                new_line_num += 1
++            elif line.startswith('-'):
++                pass
++                
++            elif line.startswith(' '):
++                content = line[1:]
++                files[current_file]['context_lines'][new_line_num] = content
++                files[current_file]['line_to_position'][new_line_num] = diff_position
++                new_line_num += 1
++
++            else:
++                pass
++        i += 1
++    return files
++
++        
+\ No newline at end of file
+diff --git a/app/llm_client.py b/app/llm_client.py
+index e69de29..44f1357 100644
+--- a/app/llm_client.py
++++ b/app/llm_client.py
+@@ -0,0 +1,21 @@
++import os
++import google.generativeai as genai
++from google.generativeai.types import GenerateContentConfig
++
++def call_llm(prompt : str) -> str:
++    api_key = os.getenv("GEMINI_API_KEY")
++    if not api_key:
++        raise ValueError("GEMINI_API_KEY environment variable is not defined.")
++
++    genai.configure(api_key = api_key)
++    model_name = os.getenv("LLM_MODEL", "gemini-2.5-flash")
++
++    config = GenerateContentConfig( response_mime_type = "application/json", temperature = 0.1 )
++
++    model = genai.GenerativeModel(model_name)
++    response = model.generate_content( prompt, config=config )
++
++    if not response.text:
++        raise RuntimeError(f"LLM returned an empty response. Full response object: {response}")
++
++    return response.text
+\ No newline at end of file
+diff --git a/app/main.py b/app/main.py
+index e69de29..78b428d 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -0,0 +1,112 @@
++import os
++import sys
++import argparse
++import requests
++from app.diff_parser import parse_diff
++from app.prompt_builder import build_review_prompt
++from app.llm_client import call_llm
++from app.output_parser import parse_and_sort_comments
++
++def post_github_review(owner : str, repo : str, pr_number : str, token : str, commit_id : str, comments : list):
++    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
++
++    headers = {
++        "Authorization": f"Bearer {token}",
++        "Accept": "application/vnd.github.v3+json",
++        "Content-Type": "application/json"
++    }
++
++    payload = {
++        "commit_id": commit_id,
++        "event": "COMMENT",
++        "body": "### Automated Code Review Feedback\nReview completed successfully.",
++        "comments": comments
++    }
++
++    response = requests.post(url, json=payload, headers=headers)
++
++    if response.status_code not in [200, 201]:
++        print(f"Failed to post review: Status: {response.status_code}")
++        print(f"Response: {response.text}")
++        sys.exit(1)
++
++    print("Code review posted successfully to GitHub.")
++
++def main():
++    parser = argparse.ArgumentParser(description="Code Review Agent")
++    parser.add_argument("--diff_file", help="Path to raw git diff file")
++    args = parser.parse_args()
++
++    if args.diff_file:
++        with open(args.diff_file, "r") as f:
++            diff_text = f.read()
++
++    else:
++        diff_text = sys.stdin.read()
++
++    if not diff_text.strip():
++        print("Empty diff. Exiting gracefully without process actions.")
++        return
++
++    parsed_diff = parse_diff(diff_text)
++    prompt = build_review_prompt(parsed_diff)
++
++    print("Instantiating LLM for code review...")
++
++    try:
++        raw_response = call_llm(prompt)
++    except Exception as e:
++        print(f"Critical System Error: Remote model client execution collapsed. Error: {e}")
++        sys.exit(1)
++
++    sorted_comments = parse_and_sort_comments(raw_response)
++
++    if not sorted_comments:
++        print("No critical findings reported by reviewer model.")
++        return
++
++    print("\n---Model Findings (Priority Order)---")
++    for c in sorted_comments:
++        print(f"[{c.severity}] {c.file}:{c.line} -> {c.comment}")
++    print("-----------------------------------\n")
++
++    gh_comments = []
++    for c in sorted_comments:
++        if c.file in parsed_diff:
++            line_map = parsed_diff[c.file]['line_to_position']
++            if c.line in line_map:
++                diff_position = line_map[c.line]
++                gh_comments.append({
++                    "path": c.file,
++                    "position": diff_position,
++                    "body": f"###[{c.severity}] Priority Finding\n{c.comment}"
++                })
++            else:
++                print(f"Warning: Line {c.line} not found in diff boundaries of {c.file}. Skipping.")
++        else:
++            print(f"Warning: File {c.file} not recognized in active changes. Skipping.")    
++
++    is_ci = os.getenv("GITHUB_ACTIONS") == "true"
++    if is_ci and gh_comments:
++        print("Action running with a gitHub environments profile. Initiating GitHub webhook API payload...")
++        token = os.getenv("GITHUB_TOKEN")
++        repository = os.getenv("GITHUB_REPOSITORY")
++        event_path = os.getenv("GITHUB_EVENT_PATH")
++
++        if not all([token, repository, event_path]):
++            print("Missing GitHub action workflow secrets context.Review termination triggered")
++            sys.exit(1)
++
++        import json
++        with open(event_path, "r") as f:
++            event_data = json.load(f)
++
++        pr_number = event_data.get("pull_request", {}).get("number")
++        commit_id = event_data.get("pull_request", {}).get("head", {}).get("sha")
++        owner, repo = repository.split("/")
++
++        post_github_review(owner = owner, repo = repo, pr_number = str(pr_number), token = token, commit_id = commit_id, comments = gh_comments)
++
++        if __name__ == "__main__":
++            main()
++
+diff --git a/app/models.py b/app/models.py
+index e69de29..be7b0f5 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -0,0 +1,12 @@
++from pydantic import BaseModel, Field
++from typing import List
++
++class codeComment(BaseModel):
++    file: str = Field(..., description = "The relative path to the file being reviewed.")
++    line: int = Field(..., description = "The line number in the new version of the file.")
++    severity: str = Field(..., description = "Severity level: P0 (security/crash), P1 (correctness), P2 (performance),P3 (style)")
++    comment: str = Field(..., description = "Constructive, specific feedback. Explain the problems and suggest a concrete solution.")
++
++
++class codeReviewSystem(BaseModel):
++    comments : List[codeComment] = Field(default_factory=list, description="List of generated code review comments.")
+\ No newline at end of file
+diff --git a/app/output_parser.py b/app/output_parser.py
+index e69de29..e741801 100644
+--- a/app/output_parser.py
++++ b/app/output_parser.py
+@@ -0,0 +1,29 @@
++import json
++from typing import List
++from app.models import codeComment
++
++def parse_and_sort_comments(raw_json: str) -> List[codeComment]:
++    try: 
++        data = json.loads(raw_json)
++
++        if isinstance( data, dict) and "comments" in data:
++            raw_comments = data["comments"]
++        elif isinstance(data, list):
++            raw_comments = data
++        else:
++            raw_comments = []
++
++        comments = []
++
++        for item in raw_comments:
++            try:
++                comment = codeComment(**item)
++                comments.append(comment)
++            except Exception as e:
++                print(f"Skipping malformed object: {item}. Error: {e}")
++        
++        severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
++        comments.sort(key = lambda c: severity_order.get(c.severity,99))
++        return comments
++    except Exception as e:
++        raise ValueError(f"Parsing failed for structured JSON response: {e} \nRaw payload: {raw_json}")
+\ No newline at end of file
+diff --git a/app/prompt_builder.py b/app/prompt_builder.py
+index e69de29..336f407 100644
+--- a/app/prompt_builder.py
++++ b/app/prompt_builder.py
+@@ -0,0 +1,58 @@
++from typing import Dict
++
++def build_review_prompt(parsed_diff: Dict[str,dict]) -> str:
++    prompt_sections = []
++
++    for file_path, data in parsed_diff.items():
++        added_lines = data.get('added_lines',{})
++        if not added_lines:
++            continue
++        
++        prompt_sections.append(f"File: {file_path}")
++        prompt_sections.append("---")
++
++        sorted_added_lines = sorted(added_lines.keys())
++        blocks = []
++
++        if sorted_added_lines:
++            current_block = [sorted_added_lines[0]]
++            for ln in sorted_added_lines[1:]:
++                if ln - current_block[-1] <= 5:
++                    current_block.append(ln)
++                else:
++                    blocks.append(current_block)
++                    current_block = [ln]
++            blocks.append(current_block)
++
++        for block in blocks:
++            start_line = max(1, min(block)-5)
++            end_line = max(block)+5
++
++            block_lines = []
++            for ln in range(start_line, end_line+1):
++                if ln in added_lines:
++                    block_lines.append(f"+ {ln}: {added_lines[ln]}")
++                elif ln in data.get('context_lines',{}):
++                    block_lines.append(f"{ln}: {data['context_lines'][ln]}")
++
++            prompt_sections.append(f"Section [Lines {start_line}-{end_line}]:")
++            prompt_sections.extend(block_lines)
++            prompt_sections.append("")    
++        prompt_sections.append("---")
++
++    instructions = """
++You are an expert software engineer performing a code review.
++Analyze the provided code changes (marked with "+") and flag critical errors.
++
++Strict priorities for review comments:
++- P0: Security vulnerabilities or immediate, unhandled code crashes.
++- P1: Code correctness, major logical bugs, or incorrect API contracts.
++- P2: Performance overheads, expensive DB calls, or memory leaks.
++- P3: Simple style consistency or minor code cleanups.
++
++Constraints:
++1. ONLY write comments pointing to lines that were changed (marked with "+").
++2. Your response must be valid JSON matching the schema: {"comments": [{"file": "path", "line": 42, "severity": "P1", "comment": "Feedback..."}]}.
++"""
++
++    return "\n".join(prompt_sections) + "\n" + instructions
+diff --git a/requirements.txt b/requirements.txt
+index 9d55dd1..692bcd8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,3 +5,6 @@ python-dotenv==1.2.2
+ requests==2.34.2
+ unidiff==0.7.5
+ urllib3==2.7.0
++pydantic>=2.0.0
++google-generativeai>=0.3.0
++requests>=2.31.0

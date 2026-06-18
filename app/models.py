@@ -1,12 +1,12 @@
 from pydantic import BaseModel, Field
 from typing import List
 
-class codeComment(BaseModel):
-    file: str = Field(..., description = "The relative path to the file being reviewed.")
-    line: int = Field(..., description = "The line number in the new version of the file.")
-    severity: str = Field(..., description = "Severity level: P0 (security/crash), P1 (correctness), P2 (performance),P3 (style)")
-    comment: str = Field(..., description = "Constructive, specific feedback. Explain the problems and suggest a concrete solution.")
+class CodeComment(BaseModel):
+    file: str = Field(..., description="The relative path to the file being reviewed.")
+    position: int = Field(..., description="The exact 1-based diff position of the line needing feedback.")
+    severity: str = Field(..., description="Severity of the issue: P0, P1, P2, or P3.")
+    comment: str = Field(..., description="Clear feedback describing the issue and recommending a specific fix.")
+    references_specific_identifier: bool = Field(..., description="True if the comment refers to a specific variable, function name, or class in the diff.")
 
-
-class codeReviewSystem(BaseModel):
-    comments : List[codeComment] = Field(default_factory=list, description="List of generated code review comments.")
+class CodeReviewResponse(BaseModel):
+    comments: List[CodeComment] = Field(default_factory=list, description="A structured list of code review findings.")

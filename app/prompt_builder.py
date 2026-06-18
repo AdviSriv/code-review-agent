@@ -1,58 +1,44 @@
-from typing import Dict
+from typing import List
 
-def build_review_prompt(parsed_diff: Dict[str,dict]) -> str:
-    prompt_sections = []
+def build_system_instruction(conventions_text: str = "") -> str:
+    instruction = """
+You are an expert software engineer performing an objective, critical code review on provided code change patches.
 
-    for file_path, data in parsed_diff.items():
-        added_lines = data.get('added_lines',{})
-        if not added_lines:
-            continue
-        
-        prompt_sections.append(f"File: {file_path}")
-        prompt_sections.append("---")
+Your feedback must strictly group comments using these priorities:
+- P0: Blocker (exploits, leaks, severe vulnerabilities, or crashes)
+- P1: Must-fix-before-merge (correctness flaws, test bugs, logical errors)
+- P2: Suggestion (performance gaps, structural issues)
+- P3: Suggestion (style updates, minor readability enhancements)
 
-        sorted_added_lines = sorted(added_lines.keys())
-        blocks = []
+You MUST structure your response as JSON matching the CodeReviewResponse schema:
+- position: The exact 1-based index (diff_pos) mapped directly from the hunk.
+- references_specific_identifier: True if feedback highlights a specific function, class, or variable name.
 
-        if sorted_added_lines:
-            current_block = [sorted_added_lines[0]]
-            for ln in sorted_added_lines[1:]:
-                if ln - current_block[-1] <= 5:
-                    current_block.append(ln)
-                else:
-                    blocks.append(current_block)
-                    current_block = [ln]
-            blocks.append(current_block)
-
-        for block in blocks:
-            start_line = max(1, min(block)-5)
-            end_line = max(block)+5
-
-            block_lines = []
-            for ln in range(start_line, end_line+1):
-                if ln in added_lines:
-                    block_lines.append(f"+ {ln}: {added_lines[ln]}")
-                elif ln in data.get('context_lines',{}):
-                    block_lines.append(f"{ln}: {data['context_lines'][ln]}")
-
-            prompt_sections.append(f"Section [Lines {start_line}-{end_line}]:")
-            prompt_sections.extend(block_lines)
-            prompt_sections.append("")    
-        prompt_sections.append("---")
-
-    instructions = """
-You are an expert software engineer performing a code review.
-Analyze the provided code changes (marked with "+") and flag critical errors.
-
-Strict priorities for review comments:
-- P0: Security vulnerabilities or immediate, unhandled code crashes.
-- P1: Code correctness, major logical bugs, or incorrect API contracts.
-- P2: Performance overheads, expensive DB calls, or memory leaks.
-- P3: Simple style consistency or minor code cleanups.
-
-Constraints:
-1. ONLY write comments pointing to lines that were changed (marked with "+").
-2. Your response must be valid JSON matching the schema: {"comments": [{"file": "path", "line": 42, "severity": "P1", "comment": "Feedback..."}]}.
+ESCALATION TOOL OPTION:
+You have access to a tool named `get_lines(file, start, end)`.
+If you require more surrounding file context to analyze security or correctness, call this tool. Use it only when critical context is missing.
 """
+    if conventions_text:
+        instruction += f"\nCustom Repository Rules to enforce:\n{conventions_text}\n"
+        
+    return instruction
 
-    return "\n".join(prompt_sections) + "\n" + instructions
+def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[str]:
+    chunks = []
+    hunks = parsed_diff.get("hunks", [])
+    
+    for idx, hunk in enumerate(hunks):
+        lines_repr = []
+        lines_repr.append(f"File: {filepath}")
+        lines_repr.append(f"Language: {language}")
+        lines_repr.append(f"Hunk: {hunk['header']}")
+        
+        for diff_pos, char, line_num, content in hunk['lines']:
+            if line_num is not None:
+                lines_repr.append(f"Line {line_num} (DiffPos {diff_pos}): {char} {content}")
+            else:
+                lines_repr.append(f"DiffPos {diff_pos}: {char} {content}")
+                
+        chunks.append("\n".join(lines_repr))
+        
+    return chunks
