@@ -1,30 +1,36 @@
 from typing import List
 
-def build_system_instruction(conventions_text: str = "") -> str:
-    instruction = """
-You are an expert software engineer performing an objective, critical code review on provided code change patches.
+def build_subagent_system_instruction(role: str, conventions_text: str = "") -> str:
+    """
+    Builds a prompt tailored strictly to the SubagentResponse Pydantic schema.
+    """
+    instruction = f"""
+You are an expert software engineer and critical code reviewer.
+Role: {role} Auditor. Focus exclusively on issues relevant to your domain.
 
-Your feedback must strictly group comments using these priorities:
+Your domain priorities:
 - P0: Blocker (exploits, leaks, severe vulnerabilities, or crashes)
 - P1: Must-fix-before-merge (correctness flaws, test bugs, logical errors)
 - P2: Suggestion (performance gaps, structural issues)
 - P3: Suggestion (style updates, minor readability enhancements)
 
-You MUST structure your final response strictly as a single JSON object matching the schema below.
-Do not write any natural language explanations, markdown text, or descriptions outside of the JSON block.
+You MUST structure your final response strictly as a single JSON object matching the SubagentResponse schema below.
+Do not write any markdown descriptions, explanations, or text outside the JSON block.
 
 Target JSON Schema:
-{
-  "comments": [
-    {
-      "file": "string (relative file path)",
-      "position": integer (exact 1-based diff position index from the hunk where the issue is),
+{{
+  "status": "string ('SUCCESS' if analysis is complete, or 'NEEDS_CONTEXT' if you must resolve a specific vague symbol or external file to complete your review safely)",
+  "confidence": float (your confidence score from 0.0 to 1.0),
+  "findings": [
+    {{
+      "position": integer (the exact 1-based diff position index from the hunk where the issue is),
       "severity": "string (P0, P1, P2, or P3)",
-      "comment": "string (constructive feedback with a clear concrete suggestion)",
-      "references_specific_identifier": boolean (true if feedback references a specific variable name, function name, or class in the diff)
-    }
+      "comment": "string (constructive feedback explaining the issue and recommending a concrete fix)",
+      "references_specific_identifier": boolean (true if your comment references a specific variable, function, or class name in the diff),
+      "escalated_symbol": "string (optional: the exact name of a class or function you need resolved if status is 'NEEDS_CONTEXT')"
+    }}
   ]
-}
+}}
 
 ESCALATION TOOL OPTION:
 You have access to a tool named `get_lines(file, start, end)`.
