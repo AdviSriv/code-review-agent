@@ -4,7 +4,7 @@ import threading
 import requests
 from google import genai
 from google.genai import types
-from app.config import get_secret
+from app.config import get_secret, is_debug_mode  # <--- Updated Import
 
 _context = {
     "owner": "",
@@ -13,12 +13,9 @@ _context = {
     "commit_sha": ""
 }
 
-# Thread safety locks and state trackers
 _lock = threading.Lock()
 get_lines_counter = 0
 get_lines_limit = 2
-
-# Reference to the active main gatekeeper for tool call pacing
 _gatekeeper_ref = None
 
 token_stats = {
@@ -30,17 +27,19 @@ token_stats = {
 def get_lines(file: str, start: int, end: int) -> str:
     """
     Escalation option to fetch full file content lines.
-    Paces tool calls using the Gatekeeper lock to prevent API quota crashes.
     """
     global get_lines_counter, get_lines_limit
     
-    # 1. Enforce thread-safe tool execution limit checks
     with _lock:
         if get_lines_limit != -1 and get_lines_counter >= get_lines_limit:
+            if is_debug_mode():
+                print(f"[DEBUG] [get_lines Tool] LLM requested get_lines('{file}', {start}, {end}) but execution limit is reached ({get_lines_limit}).")
             return f"Error: Call limit exceeded (maximum {get_lines_limit} invocations of get_lines allowed)."
         get_lines_counter += 1
         
-    # 2. Extract contents
+    if is_debug_mode():
+        print(f"[DEBUG] [get_lines Tool] LLM invoked get_lines(file='{file}', start={start}, end={end}) [Call #{get_lines_counter}]")
+
     content = ""
     if os.path.exists(file):
         try:
@@ -78,7 +77,6 @@ def get_lines(file: str, start: int, end: int) -> str:
     if not content:
         return f"Error: File '{file}' not found locally or remote parameters missing."
 
-    # 3. Synchronize rate checks to protect from 429 quota exhaustion mid-execution
     content_tokens = int(len(content) / 4)
     if _gatekeeper_ref:
         while True:
@@ -86,13 +84,13 @@ def get_lines(file: str, start: int, end: int) -> str:
             if can_go:
                 _gatekeeper_ref.record_call(content_tokens)
                 break
-            print(f"[get_lines Tool] Quota limits approaching. Throttling tool turn, waiting {wait_time:.1f}s...")
+            if is_debug_mode():
+                print(f"[DEBUG] [get_lines Tool] Quota threshold near. Delaying tool content return. Pausing thread for {wait_time:.1f}s...")
             time.sleep(wait_time)
             
     return content
 
 def reset_telemetry_counters(limit: int = 2):
-    """Resets tools usage and token accumulators safely across threads."""
     global get_lines_counter, get_lines_limit
     with _lock:
         get_lines_counter = 0
@@ -118,6 +116,9 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     max_retries = 3
     retry_delay = 3
     
+    if is_debug_mode():
+        print(f"[DEBUG] [LLM Client] Sending generation call to model '{model_name}' (Payload size: {len(prompt)} chars).")
+        
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -145,5 +146,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
         token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
         token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
+        if is_debug_mode():
+            print(f"[DEBUG] [LLM Client] Call finished. Tokens used in turn: {getattr(usage, 'total_token_count', 0)}")
         
     return response.text

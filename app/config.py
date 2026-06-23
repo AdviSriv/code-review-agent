@@ -7,24 +7,29 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".config" / "code_review_agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-# Phase 2 Default System Settings
 DEFAULT_CONFIG = {
-    # Rate Gatekeeper Margins (Gemini Free tier: 15 RPM / 250K TPM / 500 RPD)
     "MAX_RPM": 12,
     "MAX_TPM": 200000,
     "MAX_RPD": 400,
-    
-    # Token budgets
     "DEP_TOKEN_BUDGET": 1500,
     "CHUNK_TOKEN_TARGET": 5000,
-    
-    # Escalation Caps
     "MAX_ESCALATION_RETRIES": 1,
     "MAX_ROUTER_CALLS_PER_CHUNK": 1,
-    
-    # Triage skip file extensions
     "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"]
 }
+
+# Global trace state variable
+_debug_mode = False
+
+def set_debug_mode(enabled: bool):
+    global _debug_mode
+    _debug_mode = enabled
+    if enabled:
+        print("[DEBUG] System-wide detailed pipeline trace logger: ENABLED.")
+
+def is_debug_mode() -> bool:
+    global _debug_mode
+    return _debug_mode
 
 def get_config() -> dict:
     if not CONFIG_FILE.exists():
@@ -33,7 +38,6 @@ def get_config() -> dict:
     try:
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
-            # Ensure defaults are populated
             for k, v in DEFAULT_CONFIG.items():
                 data.setdefault(k, v)
             return data
@@ -91,5 +95,3 @@ if __name__ == "__main__":
 
     if updates:
         save_config(updates)
-
-        

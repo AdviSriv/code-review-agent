@@ -7,7 +7,7 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Config and parsers
-from app.config import get_secret, get_repo_pat
+from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode  # <--- Updated Import
 from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
 from app.prompt_builder import chunk_file_diffs
 import app.llm_client as llm_client
@@ -26,9 +26,6 @@ from app.validator import validate_and_deduplicate_comments
 gatekeeper = RateGatekeeper()
 
 def fetch_repo_metadata(owner: str, repo: str, token: str) -> dict:
-    """
-    Fetches core repository metadata (such as size in KB).
-    """
     url = f"https://api.github.com/repos/{owner}/{repo}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -174,6 +171,10 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, 
                 # --- Module D: Rate Gatekeeper ---
                 estimated_tokens = int(len(payload) / 4)
                 
+                if is_debug_mode():
+                    print(f"\n[DEBUG] [Pipeline] Chunk Payload size: {len(payload)} chars (~{estimated_tokens} tokens).")
+                    print(f"[DEBUG] [Pipeline] Chunk Payload Header:\n{payload[:300]}\n...")
+                
                 while True:
                     can_go, wait_time = gatekeeper.can_consume(estimated_tokens)
                     if can_go:
@@ -291,9 +292,10 @@ def main():
     parser.add_argument("--build-index", action="store_true", help="Manually trigger Module A indexing on local workspace")
     parser.add_argument("--commit", help="Commit SHA key (required for --build-index)")
     
-    # New Hyperparameters
+    # Hyperparameters
     parser.add_argument("--dep-hops", type=int, default=2, help="Dependency graph BFS depth. Set to -1 to crawl all connected nodes.")
     parser.add_argument("--max-context-calls", type=int, default=2, help="Max context escalations (get_lines) allowed per run. Set to -1 for unlimited.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed trace logging throughout the execution flow.")
     args = parser.parse_args()
     
     if args.build_index:
@@ -306,6 +308,10 @@ def main():
     # Map CLI parameters globally for server thread reuse
     server_dep_hops = args.dep_hops
     server_lines_limit = args.max_context_calls
+    
+    # Configure global debug trace parameter
+    if args.debug:
+        set_debug_mode(True)
 
     if args.server:
         server = HTTPServer(('0.0.0.0', args.port), WebhookHandler)

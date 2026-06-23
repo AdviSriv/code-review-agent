@@ -5,6 +5,7 @@ from app.llm_client import call_gemini
 from app.prompt_builder import build_subagent_system_instruction
 from app.repo_intelligence import load_repo_intelligence
 from app.chunker import get_symbol_signature_or_content
+from app.config import is_debug_mode  # <--- Updated Import
 
 SUBAGENT_PROMPTS = {
     "Security": "Role: Security Specialist. Focus only on OWASP vulnerabilities, leaks, SQL injections, and bypass structures.",
@@ -14,6 +15,9 @@ SUBAGENT_PROMPTS = {
 }
 
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
+    if is_debug_mode():
+        print(f"[DEBUG] [Orchestrator] Spawning parallel worker thread for subagent: '{role}'")
+        
     role_instruction = build_subagent_system_instruction(role, conventions_text)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     
@@ -28,7 +32,12 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
             cleaned = cleaned[:-3]
         
         data = json.loads(cleaned.strip())
-        return SubagentResponse(**data)
+        resp = SubagentResponse(**data)
+        
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Subagent '{role}' returned successfully. Status: {resp.status} | Confidence: {resp.confidence:.2f} | Findings: {len(resp.findings)}")
+            
+        return resp
     except Exception as e:
         print(f"Subagent {role} failed: {e}")
         return SubagentResponse(status="SUCCESS", confidence=0.0, findings=[])
@@ -45,11 +54,16 @@ def resolve_escalation(escalated_symbols: list, symbol_index: dict) -> str:
     resolved_findings = []
     vague_requests = []
     
+    if is_debug_mode():
+        print(f"[DEBUG] [Resolver] Resolving escalated symbols: {escalated_symbols}")
+        
     for sym in escalated_symbols:
         if sym in symbol_index:
             info = symbol_index[sym]
             content = get_symbol_signature_or_content(info["file_path"], info["line_range"])
             resolved_findings.append(f"--- Resolved Symbol Definition ({sym}) ---\n{content}")
+            if is_debug_mode():
+                print(f"[DEBUG] [Resolver]   - Found exact local index match for '{sym}' inside '{info['file_path']}'")
         else:
             vague_requests.append(sym)
             
@@ -61,6 +75,8 @@ def resolve_escalation(escalated_symbols: list, symbol_index: dict) -> str:
                     candidates.append(f"Symbol: {name} | File: {info['file_path']} | Range: {info['line_range']}")
                     
         if candidates:
+            if is_debug_mode():
+                print(f"[DEBUG] [Resolver]   - Vague symbol match failed exact lookup. Candidates identified: {len(candidates)}. Executing router call...")
             router_match = run_escalation_routing_llm(vague_requests, "\n".join(candidates[:10]))
             resolved_findings.append(f"--- Router Resolved Candidates ---\n{router_match}")
             
@@ -69,7 +85,6 @@ def resolve_escalation(escalated_symbols: list, symbol_index: dict) -> str:
 def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict) -> list:
     roles = ["Security", "Architecture", "Logic", "Maintainability"]
     
-    # Run the 4 subagents concurrently
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
         results = {futures[f]: f.result() for f in futures}
@@ -78,7 +93,6 @@ def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_i
     valid_findings = []
     escalated_roles = []
     
-    # Collect findings from initial pass
     for role, resp in results.items():
         if resp.status == "NEEDS_CONTEXT":
             escalated_roles.append(role)
@@ -86,16 +100,15 @@ def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_i
                 if f.escalated_symbol:
                     escalated_symbols.append(f.escalated_symbol)
         else:
-            # Map subagent role metadata here
             for f in resp.findings:
                 valid_findings.append((role, f))
 
     if escalated_symbols and len(escalated_roles) > 0:
-        print(f"[Orchestrator] Escalation triggered for symbols: {escalated_symbols}")
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Escalation requested by subagents {escalated_roles}. Initiating context resolver pass...")
         augmented_context = resolve_escalation(escalated_symbols, symbol_index)
         retry_payload = f"{chunk_payload}\n\n--- Escalated Resolved Context ---\n{augmented_context}"
         
-        # Retry only escalated subagents
         with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
             retry_futures = {executor.submit(run_single_subagent, role, retry_payload, conventions_text): role for role in escalated_roles}
             for rf in retry_futures:
@@ -110,7 +123,7 @@ def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_i
             file="",
             position=f.position,
             severity=f.severity,
-            role=role,  # Track which subagent generated the finding
+            role=role,
             comment=f.comment,
             references_specific_identifier=f.references_specific_identifier
         ))

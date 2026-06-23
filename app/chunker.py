@@ -1,11 +1,8 @@
 import os
 import requests
-from app.config import get_config
+from app.config import get_config, is_debug_mode  # <--- Updated Import
 
 def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
-    """
-    Fetches the content or signature of a symbol. Falls back to GitHub if the VM has no local checkout.
-    """
     if os.path.exists(filepath):
         try:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -50,42 +47,40 @@ def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_on
     return f"# File '{filepath}' not found locally or remote parameters missing."
 
 def get_recursive_dependencies(filepath: str, dependency_graph: dict, max_hops: int = 2) -> set:
-    """
-    Traverses dependency trees recursively (BFS) to gather transitive dependencies (A -> B -> C).
-    If max_hops is set to -1, it traverses all connected components (unlimited depth).
-    """
     resolved_files = set()
     queue = [(filepath, 0)]
     visited = {filepath}
     
+    if is_debug_mode():
+        print(f"[DEBUG] [Chunker] Resolving dependencies recursively for: '{filepath}' (Max Hops: {max_hops})")
+        
     while queue:
         curr_file, hop = queue.pop(0)
         
-        # Enforce BFS boundary checks unless max_hops is -1 (unlimited)
         if max_hops != -1 and hop >= max_hops:
             continue
             
         imports = dependency_graph.get(curr_file, {}).get("imports", [])
+        if is_debug_mode() and imports:
+            print(f"[DEBUG] [Chunker]   - Hop {hop} -> File '{curr_file}' imports: {imports}")
+            
         for imp in imports:
-            # Map import path notations (e.g. app.database) to actual file paths (e.g. app/database.py)
             imp_file = imp.replace(".", "/") + ".py"
             if imp_file in dependency_graph and imp_file not in visited:
                 visited.add(imp_file)
                 resolved_files.add(imp_file)
                 queue.append((imp_file, hop + 1))
                 
+    if is_debug_mode():
+        print(f"[DEBUG] [Chunker]   - Complete transitive component resolved. Total modules found: {len(resolved_files)}")
+        
     return resolved_files
 
 def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict, max_hops: int = 2) -> str:
-    """
-    Aggregates transitive definitions up to N hops, switching to fallback mode (signatures only) if budget bounds approach.
-    """
     config = get_config()
     token_budget = config.get("DEP_TOKEN_BUDGET", 1500)
     
     bundle_lines = ["\n--- TRANSITIVE MODULE CONTEXT LOG ---"]
-    
-    # Run BFS traversal to resolve transitive modules
     transitive_deps = get_recursive_dependencies(filepath, dependency_graph, max_hops=max_hops)
     
     accumulated_chars = sum(len(x) for x in bundle_lines)
@@ -100,15 +95,19 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
             content = get_symbol_signature_or_content(dep_file, meta["line_range"], fallback_only=fallback_mode)
             payload = f"\nDependency definition for '{sym_name}' (inside '{dep_file}'):\n{content}"
             
-            # Simple token estimation rule (characters divided by 4)
             if (accumulated_chars + len(payload)) / 4 > token_budget:
                 fallback_mode = True
                 content = get_symbol_signature_or_content(dep_file, meta["line_range"], fallback_only=True)
                 payload = f"\nDependency definition Signature for '{sym_name}' (inside '{dep_file}'):\n{content}"
+                if is_debug_mode():
+                    print(f"[DEBUG] [Chunker] Token budget approaching threshold. Compiling '{sym_name}' using Fallback Signatures only.")
                 
             bundle_lines.append(payload)
             accumulated_chars += len(payload)
             
+    if is_debug_mode():
+        print(f"[DEBUG] [Chunker] Dependency context compilation complete. Active size: {accumulated_chars} characters (~{int(accumulated_chars/4)} tokens).")
+        
     if len(bundle_lines) <= 1:
         return ""
         
