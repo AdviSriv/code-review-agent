@@ -10,12 +10,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from app.config import get_secret, get_repo_pat
 from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
 from app.prompt_builder import chunk_file_diffs
-from app.llm_client import reset_telemetry_counters, token_stats
+import app.llm_client as llm_client
 from app.models import CodeComment
 from app.output_parser import build_github_review_payload
 from app.repo_checks import get_repo_conventions, fetch_and_validate_commits
 
-# Phase 2 Modules
+# Import Phase 2 Modules
 from app.repo_intelligence import load_repo_intelligence, build_repo_intelligence
 from app.triage import evaluate_docs_only_skip, run_native_compile_check
 from app.chunker import compile_dependency_bundle
@@ -95,7 +95,7 @@ def post_github_review(owner: str, repo: str, pr_number: str, token: str, commit
     else:
         print("Grouped Pull Request review posted successfully.")
 
-def run_review_pipeline(repo_full_name: str, pr_number: str):
+def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, get_lines_limit: int = 2):
     print(f"\n[Pipeline] Initializing Review for {repo_full_name} PR #{pr_number}")
     try:
         token = get_repo_pat(repo_full_name)
@@ -105,7 +105,7 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             
         owner, repo = repo_full_name.split("/")
         
-        # Gather repository statistics (size / metadata)
+        # Fetch repository statistics (size / metadata)
         repo_meta = fetch_repo_metadata(owner, repo, token)
         repo_size_kb = repo_meta.get("size", 0)
         
@@ -134,13 +134,13 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
             return
             
-        # Initialize Context & Telemetry
-        from app.llm_client import _context
-        _context["owner"] = owner
-        _context["repo"] = repo
-        _context["token"] = token
-        _context["commit_sha"] = commit_id
-        reset_telemetry_counters()
+        # Initialize Context, Telemetry, and Gatekeeper pointers
+        llm_client._context["owner"] = owner
+        llm_client._context["repo"] = repo
+        llm_client._context["token"] = token
+        llm_client._context["commit_sha"] = commit_id
+        llm_client._gatekeeper_ref = gatekeeper
+        llm_client.reset_telemetry_counters(get_lines_limit)
         
         # Load Module A indices
         intel_data = load_repo_intelligence(base_sha)
@@ -149,8 +149,6 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
         
         all_comments = []
         total_diff_lines = 0
-        
-        # Fetch repository conventions once
         conventions = get_repo_conventions(owner, repo, token)
         
         # 3. Process changes per file
@@ -169,8 +167,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             chunks = chunk_file_diffs(filename, lang, parsed_diff)
             
             for chunk in chunks:
-                # Compile dependencies from index
-                dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph)
+                # Compile recursive dependency structures
+                dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
                 payload = f"{chunk}\n\n{dep_bundle}"
                 
                 # --- Module D: Rate Gatekeeper ---
@@ -185,10 +183,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
                 
                 # --- Module E & F: Subagent Orchestrator ---
                 print(f"[Pipeline] Analysing file chunks: '{filename}'...")
-                # We pass the raw conventions directly to the orchestrator
                 chunk_comments = orchestrate_chunk_review(payload, conventions, symbol_index)
                 
-                # Record API consumption metrics
                 gatekeeper.record_call(estimated_tokens)
                 
                 # --- Module G: Aggregation & Validation ---
@@ -219,9 +215,9 @@ def run_review_pipeline(repo_full_name: str, pr_number: str):
             print("Repository size: Unknown/Unavailable")
         print(f"PR Diff size: {total_diff_lines:,} total lines processed")
         print(f"Tokens consumed for evaluation:")
-        print(f"  - Input (Prompt) Tokens: {token_stats['prompt_tokens']:,}")
-        print(f"  - Output (Completion) Tokens: {token_stats['candidates_tokens']:,}")
-        print(f"  - Total Tokens consumed: {token_stats['total_tokens']:,}")
+        print(f"  - Input (Prompt) Tokens: {llm_client.token_stats['prompt_tokens']:,}")
+        print(f"  - Output (Completion) Tokens: {llm_client.token_stats['candidates_tokens']:,}")
+        print(f"  - Total Tokens consumed: {llm_client.token_stats['total_tokens']:,}")
         print("=========================================================\n")
             
     except Exception as e:
@@ -234,7 +230,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
             
-        content_length = int(self.headers.get('Content-Length', 0))
+        content_length = int(self.headers.get('Content-Length', 0) or 0)
         post_data = self.rfile.read(content_length)
         
         try:
@@ -265,9 +261,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.send_response(202)
                 self.end_headers()
                 
+                # Fetch default parameters from global server scope
                 thread = threading.Thread(
                     target=run_review_pipeline,
-                    args=(repo_full_name, str(pr_number))
+                    args=(repo_full_name, str(pr_number), server_dep_hops, server_lines_limit)
                 )
                 thread.start()
             else:
@@ -278,7 +275,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             print(f"Error handling webhook: {e}")
 
+# Globals to share parsed parameters across threads in server mode
+server_dep_hops = 2
+server_lines_limit = 2
+
 def main():
+    global server_dep_hops, server_lines_limit
+    
     parser = argparse.ArgumentParser(description="Phase 2 Code Review Agent")
     parser.add_argument("--repo", help="Target repository 'owner/repo'")
     parser.add_argument("--pr", help="Pull request ID number")
@@ -287,6 +290,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Webhook server port")
     parser.add_argument("--build-index", action="store_true", help="Manually trigger Module A indexing on local workspace")
     parser.add_argument("--commit", help="Commit SHA key (required for --build-index)")
+    
+    # New Hyperparameters
+    parser.add_argument("--dep-hops", type=int, default=2, help="Dependency graph BFS depth. Set to -1 to crawl all connected nodes.")
+    parser.add_argument("--max-context-calls", type=int, default=2, help="Max context escalations (get_lines) allowed per run. Set to -1 for unlimited.")
     args = parser.parse_args()
     
     if args.build_index:
@@ -296,9 +303,13 @@ def main():
         build_repo_intelligence(".", args.commit)
         return
 
+    # Map CLI parameters globally for server thread reuse
+    server_dep_hops = args.dep_hops
+    server_lines_limit = args.max_context_calls
+
     if args.server:
         server = HTTPServer(('0.0.0.0', args.port), WebhookHandler)
-        print(f"Webhook Receiver active on port {args.port}...")
+        print(f"Webhook Receiver active on port {args.port} (Hops: {server_dep_hops}, Context Calls: {server_lines_limit})...")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -306,7 +317,6 @@ def main():
         return
 
     if args.diff_file:
-        # Local offline test path compatible with Phase 2 models
         print(f"Reading local diff file: {args.diff_file}...")
         try:
             with open(args.diff_file, "r") as f:
@@ -315,7 +325,7 @@ def main():
             print(f"Failed to read file: {e}")
             sys.exit(1)
             
-        reset_telemetry_counters()
+        llm_client.reset_telemetry_counters(args.max_context_calls)
         parsed_files = parse_full_diff(diff_text)
         all_comments = []
         conventions = get_repo_conventions()
@@ -330,25 +340,23 @@ def main():
             
             for chunk in chunks:
                 try:
-                    # Pass conventions directly into the offline orchestrator path
                     comments = orchestrate_chunk_review(chunk, conventions, symbol_index={})
                     all_comments.extend(comments)
                 except Exception as e:
                     print(f"Error reviewing chunk: {e}")
                     
-        # Render local metrics summary
         print("\n================== PERFORMANCE METRICS ==================")
         print("Repository size: N/A (offline local execution mode)")
         print(f"PR Diff size: {total_diff_lines:,} total lines processed")
         print(f"Tokens consumed for evaluation:")
-        print(f"  - Input (Prompt) Tokens: {token_stats['prompt_tokens']:,}")
-        print(f"  - Output (Completion) Tokens: {token_stats['candidates_tokens']:,}")
-        print(f"  - Total Tokens consumed: {token_stats['total_tokens']:,}")
+        print(f"  - Input (Prompt) Tokens: {llm_client.token_stats['prompt_tokens']:,}")
+        print(f"  - Output (Completion) Tokens: {llm_client.token_stats['candidates_tokens']:,}")
+        print(f"  - Total Tokens consumed: {llm_client.token_stats['total_tokens']:,}")
         print("=========================================================\n")
         return
         
     if args.repo and args.pr:
-        run_review_pipeline(args.repo, args.pr)
+        run_review_pipeline(args.repo, args.pr, dep_hops=args.dep_hops, get_lines_limit=args.max_context_calls)
     else:
         parser.print_help()
 

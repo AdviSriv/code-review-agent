@@ -2,11 +2,12 @@ import json
 from typing import List
 from app.models import CodeReviewResponse, CodeComment
 
+# Map raw severities directly to P-level labels
 SEVERITY_LABELS = {
-    "P0": "Blocker",
-    "P1": "Must-fix-before-merge",
-    "P2": "Suggestion",
-    "P3": "Suggestion"
+    "P0": "Blocker (P0)",
+    "P1": "Must-fix-before-merge (P1)",
+    "P2": "Suggestion (P2)",
+    "P3": "Suggestion (P3)"
 }
 
 def parse_and_sort_comments(raw_text: str) -> List[CodeComment]:

@@ -5,9 +5,6 @@ from app.config import get_config
 from app.diff_parser import is_ignored_file
 
 def evaluate_docs_only_skip(changed_files: list) -> bool:
-    """
-    Returns True if 100% of files fall under document, lockfile, or ignored extensions.
-    """
     if not changed_files:
         return True
         
@@ -23,15 +20,23 @@ def evaluate_docs_only_skip(changed_files: list) -> bool:
             
     return True
 
-# Extensible compiler registry mapping extensions to commands
+# Comprehensive compiler and static logic checks
 COMPILER_REGISTRY = {
     ".py": {
         "lang": "Python",
-        "cmd": lambda files: [sys.executable or "python3", "-m", "py_compile"] + files
+        "cmd": lambda files: [sys.executable or "python3", "-m", "py_compile"] + files,
+        # Secondary static rules to execute if available on the VM
+        "linters": [
+            {"exec": "ruff", "args": lambda files: ["ruff", "check", "--no-fix"] + files},
+            {"exec": "mypy", "args": lambda files: ["mypy", "--ignore-missing-imports"] + files}
+        ]
     },
     ".js": {
         "lang": "JavaScript",
-        "cmd": lambda files: ["node", "--check"] + files
+        "cmd": lambda files: ["node", "--check"] + files,
+        "linters": [
+            {"exec": "eslint", "args": lambda files: ["npx", "eslint"] + files}
+        ]
     },
     ".ts": {
         "lang": "TypeScript",
@@ -48,11 +53,7 @@ COMPILER_REGISTRY = {
 }
 
 def is_executable_available(name: str) -> bool:
-    """
-    Verifies if a specific compiler executable exists on the VM's path.
-    """
     try:
-        # Cross-platform check using standard command-line tools
         subprocess.run(["which", name], capture_output=True, check=True)
         return True
     except Exception:
@@ -60,13 +61,11 @@ def is_executable_available(name: str) -> bool:
 
 def run_native_compile_check(changed_files: list) -> dict:
     """
-    Runs language-specific compiler or syntax checks on changed files.
-    Collects errors dynamically and generates a generic syntax-failure report.
+    Runs compiler/syntax passes, followed by local lint/static checkers if available.
     """
     errors = []
     failed_languages = set()
     
-    # 1. Group changed files by their extension
     grouped_files = {}
     for f in changed_files:
         if not os.path.exists(f):
@@ -75,31 +74,40 @@ def run_native_compile_check(changed_files: list) -> dict:
         if ext in COMPILER_REGISTRY:
             grouped_files.setdefault(ext, []).append(f)
             
-    # 2. Run checks for each detected language group
     for ext, files in grouped_files.items():
         rule = COMPILER_REGISTRY[ext]
         lang_name = rule["lang"]
         cmd_generator = rule["cmd"]
         
-        # Formulate execution command
+        # 1. Run mandatory base compilation checks
         cmd = cmd_generator(files)
         executable = cmd[0]
         
-        # Guard: Check if compiler/linter is installed on the host VM
         if not is_executable_available(executable):
-            print(f"[Triage] Skipping {lang_name} check: '{executable}' is not installed on VM.")
+            print(f"[Triage] Compiler '{executable}' not found on VM. Skipping check.")
             continue
             
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
-            errors.append(f"[{lang_name} Errors]\n{err}")
+            errors.append(f"[{lang_name} Syntax Error]\n{err}")
             failed_languages.add(lang_name)
+            continue  # Re-raise compile errors immediately
+            
+        # 2. Run runtime static assertions (e.g. Ruff/Mypy/Eslint) if present
+        for linter in rule.get("linters", []):
+            lexec = linter["exec"]
+            if is_executable_available(lexec):
+                lcmd = linter["args"](files)
+                lres = subprocess.run(lcmd, capture_output=True, text=True)
+                if lres.returncode != 0:
+                    lerr = lres.stderr.strip() or lres.stdout.strip()
+                    errors.append(f"[{lang_name} {lexec.capitalize()} Logic/Type Error]\n{lerr}")
+                    failed_languages.add(lang_name)
 
-    # 3. Compile the language-specific feedback
     if errors:
         langs_str = " & ".join(sorted(failed_languages))
-        header = f"### ❌ Syntax Check Failed\nCompilation/syntax checks failed on changed **{langs_str}** files. Code review has been skipped to prevent generating hallucinated feedback."
+        header = f"### ❌ Local Triage Verification Failed\nStatic validation failed on changed **{langs_str}** files. Build-level issues must be resolved before triggering AI code reviews."
         body = "\n\n".join(errors[:10])
         if len(errors) > 10:
             body += f"\n\n*+ {len(errors) - 10} more errors output truncated*"

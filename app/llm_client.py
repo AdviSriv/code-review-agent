@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 from google import genai
 from google.genai import types
@@ -12,7 +13,13 @@ _context = {
     "commit_sha": ""
 }
 
+# Thread safety locks and state trackers
+_lock = threading.Lock()
 get_lines_counter = 0
+get_lines_limit = 2
+
+# Reference to the active main gatekeeper for tool call pacing
+_gatekeeper_ref = None
 
 token_stats = {
     "prompt_tokens": 0,
@@ -22,56 +29,77 @@ token_stats = {
 
 def get_lines(file: str, start: int, end: int) -> str:
     """
-    Escalation option to get the actual file content lines between start and end (inclusive)
-    for extra surrounding context if needed. Max 2 calls allowed per review run.
+    Escalation option to fetch full file content lines.
+    Paces tool calls using the Gatekeeper lock to prevent API quota crashes.
     """
-    global get_lines_counter
-    get_lines_counter += 1
-    if get_lines_counter > 2:
-        return "Error: Call limit exceeded (maximum 2 invocations of get_lines allowed per review run)."
+    global get_lines_counter, get_lines_limit
+    
+    # 1. Enforce thread-safe tool execution limit checks
+    with _lock:
+        if get_lines_limit != -1 and get_lines_counter >= get_lines_limit:
+            return f"Error: Call limit exceeded (maximum {get_lines_limit} invocations of get_lines allowed)."
+        get_lines_counter += 1
         
-    # 1. Check local file system
+    # 2. Extract contents
+    content = ""
     if os.path.exists(file):
         try:
             with open(file, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             start_idx = max(0, start - 1)
             end_idx = min(len(lines), end)
-            return "".join(lines[start_idx:end_idx])
+            content = "".join(lines[start_idx:end_idx])
         except Exception:
             pass
             
-    # 2. Remote fallback over API
-    owner = _context.get("owner")
-    repo = _context.get("repo")
-    token = _context.get("token")
-    ref = _context.get("commit_sha")
-    
-    if owner and repo and token and ref:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3.raw"
-        }
-        params = {"ref": ref}
-        try:
-            response = requests.get(url, headers=headers, params=params)
-            if response.status_code == 200:
-                lines = response.text.splitlines(keepends=True)
-                start_idx = max(0, start - 1)
-                end_idx = min(len(lines), end)
-                return "".join(lines[start_idx:end_idx])
-        except Exception:
-            pass
-            
-    return f"Error: File '{file}' not found locally or remote parameters missing."
+    if not content:
+        owner = _context.get("owner")
+        repo = _context.get("repo")
+        token = _context.get("token")
+        ref = _context.get("commit_sha")
+        
+        if owner and repo and token and ref:
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file}"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.v3.raw"
+            }
+            params = {"ref": ref}
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    lines = response.text.splitlines(keepends=True)
+                    start_idx = max(0, start - 1)
+                    end_idx = min(len(lines), end)
+                    content = "".join(lines[start_idx:end_idx])
+            except Exception:
+                pass
+                
+    if not content:
+        return f"Error: File '{file}' not found locally or remote parameters missing."
 
-def reset_telemetry_counters():
-    global get_lines_counter
-    get_lines_counter = 0
-    token_stats["prompt_tokens"] = 0
-    token_stats["candidates_tokens"] = 0
-    token_stats["total_tokens"] = 0
+    # 3. Synchronize rate checks to protect from 429 quota exhaustion mid-execution
+    content_tokens = int(len(content) / 4)
+    if _gatekeeper_ref:
+        while True:
+            can_go, wait_time = _gatekeeper_ref.can_consume(content_tokens)
+            if can_go:
+                _gatekeeper_ref.record_call(content_tokens)
+                break
+            print(f"[get_lines Tool] Quota limits approaching. Throttling tool turn, waiting {wait_time:.1f}s...")
+            time.sleep(wait_time)
+            
+    return content
+
+def reset_telemetry_counters(limit: int = 2):
+    """Resets tools usage and token accumulators safely across threads."""
+    global get_lines_counter, get_lines_limit
+    with _lock:
+        get_lines_counter = 0
+        get_lines_limit = limit
+        token_stats["prompt_tokens"] = 0
+        token_stats["candidates_tokens"] = 0
+        token_stats["total_tokens"] = 0
 
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     api_key = get_secret("GEMINI_API_KEY")
@@ -87,9 +115,8 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         tools=[get_lines]
     )
     
-    # Retry engine parameters
     max_retries = 3
-    retry_delay = 3  # Wait 3 seconds initially, doubling each attempt
+    retry_delay = 3
     
     for attempt in range(max_retries):
         try:
@@ -100,7 +127,6 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
             )
             break
         except Exception as e:
-            # Check for transient server issues (503) or rate limits (429)
             error_str = str(e)
             is_transient = "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str or "RESOURCE_EXHAUSTED" in error_str
             
@@ -109,7 +135,6 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
-                # Re-raise the exception if the retry attempts are exhausted
                 raise e
     
     if not response.text:
