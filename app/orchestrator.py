@@ -2,12 +2,18 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from app.models import SubagentResponse, CodeComment
 from app.llm_client import call_gemini
-from app.prompt_builder import build_subagent_system_instruction  # <--- Updated Import
+from app.prompt_builder import build_subagent_system_instruction
 from app.repo_intelligence import load_repo_intelligence
 from app.chunker import get_symbol_signature_or_content
 
+SUBAGENT_PROMPTS = {
+    "Security": "Role: Security Specialist. Focus only on OWASP vulnerabilities, leaks, SQL injections, and bypass structures.",
+    "Architecture": "Role: Systems Architect. Focus on file decoupling, interfaces, design patterns, and package boundaries.",
+    "Logic": "Role: Logic Auditor. Focus on loop bounds, state management, edge conditions, and algorithm flaws.",
+    "Maintainability": "Role: Code Quality Auditor. Focus on cyclomatic complexity, dead code, duplicates, and spelling errors."
+}
+
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
-    # Build a dedicated instruction set with the correct JSON schema
     role_instruction = build_subagent_system_instruction(role, conventions_text)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     
@@ -72,6 +78,7 @@ def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_i
     valid_findings = []
     escalated_roles = []
     
+    # Collect findings from initial pass
     for role, resp in results.items():
         if resp.status == "NEEDS_CONTEXT":
             escalated_roles.append(role)
@@ -79,25 +86,31 @@ def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_i
                 if f.escalated_symbol:
                     escalated_symbols.append(f.escalated_symbol)
         else:
-            valid_findings.extend(resp.findings)
+            # Map subagent role metadata here
+            for f in resp.findings:
+                valid_findings.append((role, f))
 
     if escalated_symbols and len(escalated_roles) > 0:
         print(f"[Orchestrator] Escalation triggered for symbols: {escalated_symbols}")
         augmented_context = resolve_escalation(escalated_symbols, symbol_index)
         retry_payload = f"{chunk_payload}\n\n--- Escalated Resolved Context ---\n{augmented_context}"
         
+        # Retry only escalated subagents
         with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
             retry_futures = {executor.submit(run_single_subagent, role, retry_payload, conventions_text): role for role in escalated_roles}
             for rf in retry_futures:
+                role = retry_futures[rf]
                 resp = rf.result()
-                valid_findings.extend(resp.findings)
+                for f in resp.findings:
+                    valid_findings.append((role, f))
 
     final_comments = []
-    for f in valid_findings:
+    for role, f in valid_findings:
         final_comments.append(CodeComment(
             file="",
             position=f.position,
             severity=f.severity,
+            role=role,  # Track which subagent generated the finding
             comment=f.comment,
             references_specific_identifier=f.references_specific_identifier
         ))

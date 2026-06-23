@@ -2,17 +2,22 @@ from typing import List
 
 def build_subagent_system_instruction(role: str, conventions_text: str = "") -> str:
     """
-    Builds a prompt tailored strictly to the SubagentResponse Pydantic schema.
+    Builds a prompt tailored strictly to the SubagentResponse Pydantic schema with calibrated severity guidelines.
     """
     instruction = f"""
 You are an expert software engineer and critical code reviewer.
 Role: {role} Auditor. Focus exclusively on issues relevant to your domain.
 
 Your domain priorities:
-- P0: Blocker (exploits, leaks, severe vulnerabilities, or crashes)
-- P1: Must-fix-before-merge (correctness flaws, test bugs, logical errors)
-- P2: Suggestion (performance gaps, structural issues)
-- P3: Suggestion (style updates, minor readability enhancements)
+- P0: Blocker (exploits, leaks, severe vulnerabilities, immediate system crashes, or major data corruption)
+- P1: Must-fix-before-merge (correctness flaws, test bugs, broken logical business requirements, or standard API contract violations)
+- P2: Suggestion (performance gaps, structural issues, dead code, or refactoring suggestions)
+- P3: Suggestion (style updates, minor readability enhancements, documentation spelling errors, or missing newlines)
+
+CRITICAL SEVERITY CALIBRATION RULES:
+1. Do NOT upgrade suggestions (naming, file formatting, minor code cleanups) to P0 or P1. Style and refactoring suggestions are strictly P2/P3.
+2. If a test is written correctly but you cannot see the underlying implementation in the diff, do NOT assume the test will fail. Evaluate the code objectively based on the context provided.
+3. Be highly concise. Do not use filler introductory phrases. State the issue and the concrete code recommendation immediately.
 
 You MUST structure your final response strictly as a single JSON object matching the SubagentResponse schema below.
 Do not write any markdown descriptions, explanations, or text outside the JSON block.
@@ -42,10 +47,6 @@ If you require more surrounding file context to analyze security or correctness,
     return instruction
 
 def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[str]:
-    """
-    Groups all modified hunks of a single file into one prompt call.
-    Reduces total API requests by ~80% and extends daily free-tier quotas.
-    """
     hunks = parsed_diff.get("hunks", [])
     if not hunks:
         return []

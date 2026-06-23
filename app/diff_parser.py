@@ -1,7 +1,7 @@
 import os
 
 IGNORED_EXTENSIONS = {
-    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.woff', '.woff2', '.ttf', '.eot'
+    '.txt','.md', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.woff', '.woff2', '.ttf', '.eot'
 }
 
 IGNORED_FILENAMES = {

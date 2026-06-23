@@ -1,69 +1,76 @@
 import os
+import requests
 from app.config import get_config
 
 def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
     """
-    Fetches the content or the signature of a symbol from a file.
+    Fetches the content or signature of a symbol from the VM's disk.
+    If the file does not exist locally, falls back to the GitHub API using context.
     """
-    if not os.path.exists(filepath):
-        return f"# File {filepath} not found locally."
-        
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
+    # 1. Try local filesystem lookup
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            start = max(0, line_range[0] - 1)
+            end = min(len(lines), line_range[1])
+            symbol_lines = lines[start:end]
             
-        start = max(0, line_range[0] - 1)
-        end = min(len(lines), line_range[1])
-        symbol_lines = lines[start:end]
-        
-        if fallback_only:
-            # Fall back to returning only the definition line
-            return symbol_lines[0].strip() if symbol_lines else ""
+            if fallback_only:
+                return symbol_lines[0].strip() if symbol_lines else ""
+            return "".join(symbol_lines)
+        except Exception:
+            pass
             
-        return "".join(symbol_lines)
-    except Exception as e:
-        return f"# Error reading symbol from {filepath}: {e}"
-
-def compile_dependency_bundle(filepath: str, parsed_diff_file: dict, symbol_index: dict, dependency_graph: dict) -> str:
-    """
-    Collects 1-hop file dependencies and signatures under the token cap.
-    """
-    config = get_config()
-    token_budget = config.get("DEP_TOKEN_BUDGET", 1500)
+    # 2. Remote API Fallback (Enables cross-file reasoning in server webhook environments)
+    from app.llm_client import _context
+    owner = _context.get("owner")
+    repo = _context.get("repo")
+    token = _context.get("token")
+    ref = _context.get("commit_sha")  # Resolves the modified HEAD commit on the branch
     
-    bundle_parts = []
-    # Fetch what this file imports and what imports this file
-    graph_data = dependency_graph.get(filepath, {"imports": [], "imported_by": []})
-    
-    imports = graph_data["imports"]
-    imported_by = graph_data["imported_by"]
-    
-    # 1. Pull import signatures
-    bundle_parts.append(f"--- File Dependencies for '{filepath}' ---")
-    bundle_parts.append(f"Imports from modules: {', '.join(imports)}")
-    bundle_parts.append(f"Imported by active workspace files: {', '.join(imported_by)}")
-    
-    # Estimate token usage (~4 characters per token as a safe rule)
-    accumulated_chars = sum(len(x) for x in bundle_parts)
-    fallback_mode = False
-    
-    for dep in imports + imported_by:
-        # Match dependency files to their defined symbols
-        matching_symbols = [name for name, info in symbol_index.items() if info["file_path"] in dep]
-        
-        for sym_name in matching_symbols:
-            info = symbol_index[sym_name]
-            # Try fetching full definition
-            sym_content = get_symbol_signature_or_content(info["file_path"], info["line_range"], fallback_only=fallback_mode)
-            
-            payload = f"\nSymbol Definition ({sym_name} in {info['file_path']}):\n{sym_content}"
-            if (accumulated_chars + len(payload)) / 4 > token_budget:
-                # If budget is exceeded, switch to fallback mode (signatures only)
-                fallback_mode = True
-                sym_content = get_symbol_signature_or_content(info["file_path"], info["line_range"], fallback_only=True)
-                payload = f"\nSymbol Definition Signature ({sym_name} in {info['file_path']}):\n{sym_content}"
+    if owner and repo and token and ref:
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3.raw"
+        }
+        params = {"ref": ref}
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                lines = response.text.splitlines(keepends=True)
+                start = max(0, line_range[0] - 1)
+                end = min(len(lines), line_range[1])
+                symbol_lines = lines[start:end]
                 
-            bundle_parts.append(payload)
-            accumulated_chars += len(payload)
+                if fallback_only:
+                    return symbol_lines[0].strip() if symbol_lines else ""
+                return "".join(symbol_lines)
+        except Exception as e:
+            return f"# Remote fallback error loading {filepath}: {e}"
             
-    return "\n".join(bundle_parts)
+    return f"# File '{filepath}' not found locally or remote parameters missing."
+
+def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict) -> str:
+    """
+    Aggerves code context of imported dependencies to prevent false positives.
+    """
+    # Look up dependencies associated with the current file path
+    dependencies = dependency_graph.get(filepath, {}).get("imports", [])
+    if not dependencies:
+        return ""
+        
+    bundle_lines = ["\n--- DEPENDENT CONTEXT LOG ---"]
+    for dep in dependencies:
+        # Check if the imported dependency is indexed in our codebase
+        if dep in symbol_index:
+            meta = symbol_index[dep]
+            dep_file = meta.get("file_path")
+            lines_range = meta.get("lines", [1, 20])
+            
+            content = get_symbol_signature_or_content(dep_file, lines_range)
+            bundle_lines.append(f"\nImported symbol '{dep}' definition from '{dep_file}':")
+            bundle_lines.append(content)
+            
+    return "\n".join(bundle_lines)

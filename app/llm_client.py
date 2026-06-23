@@ -79,7 +79,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         raise ValueError("GEMINI_API_KEY is not defined. Run `python -m app.config --set-gemini` to configure it.")
         
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("LLM_MODEL", "gemini-3.5-flash")
+    model_name = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
     
     config = types.GenerateContentConfig(
         temperature=0.1,
