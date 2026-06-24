@@ -57,14 +57,14 @@ def format_terminal_output(comments: List[CodeComment]):
 def build_github_review_payload(comments: List[CodeComment]) -> List[dict]:
     gh_comments = []
     
-    # Sort by severity before posting (P0 -> P3)
+    # Sort review findings strictly by severity (P0 -> P3)
     severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     comments.sort(key=lambda c: severity_order.get(c.severity, 99))
     
     for c in comments:
         label = SEVERITY_LABELS.get(c.severity, "Suggestion")
         
-        # Dynamically append parenthetical category labels
+        # Format header based on whether the comment card is coalesced or single-agent
         if c.role == "Multiple":
             header = f"### ⚠️ [{label}] Coalesced Findings"
         else:

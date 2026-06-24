@@ -33,7 +33,7 @@ def get_lines(file: str, start: int, end: int) -> str:
     with _lock:
         if get_lines_limit != -1 and get_lines_counter >= get_lines_limit:
             if is_debug_mode():
-                print(f"[DEBUG] [get_lines Tool] LLM requested get_lines('{file}', {start}, {end}) but execution limit is reached ({get_lines_limit}).")
+                print(f"[DEBUG] [get_lines Tool] LLM requested get_lines('{file}', {start}, {end}) but limit is reached.")
             return f"Error: Call limit exceeded (maximum {get_lines_limit} invocations of get_lines allowed)."
         get_lines_counter += 1
         
@@ -41,9 +41,14 @@ def get_lines(file: str, start: int, end: int) -> str:
         print(f"[DEBUG] [get_lines Tool] LLM invoked get_lines(file='{file}', start={start}, end={end}) [Call #{get_lines_counter}]")
 
     content = ""
-    if os.path.exists(file):
+    
+    # 1. Resolve path within the dynamic workspace if configured
+    workspace = _context.get("workspace")
+    target_path = os.path.join(workspace, file) if workspace else file
+    
+    if os.path.exists(target_path):
         try:
-            with open(file, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             start_idx = max(0, start - 1)
             end_idx = min(len(lines), end)
@@ -51,6 +56,7 @@ def get_lines(file: str, start: int, end: int) -> str:
         except Exception:
             pass
             
+    # 2. Remote API Fallback
     if not content:
         owner = _context.get("owner")
         repo = _context.get("repo")

@@ -1,8 +1,11 @@
 import os
 import requests
-from app.config import get_config, is_debug_mode  # <--- Updated Import
+from app.config import get_config, is_debug_mode
 
 def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
+    """
+    Fetches the content or signature of a symbol. Falls back to GitHub if the VM has no local checkout.
+    """
     if os.path.exists(filepath):
         try:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -47,6 +50,10 @@ def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_on
     return f"# File '{filepath}' not found locally or remote parameters missing."
 
 def get_recursive_dependencies(filepath: str, dependency_graph: dict, max_hops: int = 2) -> set:
+    """
+    Traverses dependency trees recursively (BFS) to gather transitive dependencies (A -> B -> C).
+    If max_hops is set to -1, it traverses all connected components (unlimited depth).
+    """
     resolved_files = set()
     queue = [(filepath, 0)]
     visited = {filepath}
@@ -77,6 +84,10 @@ def get_recursive_dependencies(filepath: str, dependency_graph: dict, max_hops: 
     return resolved_files
 
 def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict, max_hops: int = 2) -> str:
+    """
+    Aggregates transitive definitions up to N hops, embedding explicit line-range parameters
+    into metadata headers to prevent the LLM from guessing tool arguments.
+    """
     config = get_config()
     token_budget = config.get("DEP_TOKEN_BUDGET", 1500)
     
@@ -91,16 +102,17 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
         
         for sym_name in matching_symbols:
             meta = symbol_index[sym_name]
+            line_range = meta.get("line_range", [1, 20])
             
-            content = get_symbol_signature_or_content(dep_file, meta["line_range"], fallback_only=fallback_mode)
-            payload = f"\nDependency definition for '{sym_name}' (inside '{dep_file}'):\n{content}"
+            content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=fallback_mode)
             
-            if (accumulated_chars + len(payload)) / 4 > token_budget:
+            # Reconstruct payload headers with explicit start and end line bounds
+            if (accumulated_chars + len(content)) / 4 > token_budget:
                 fallback_mode = True
-                content = get_symbol_signature_or_content(dep_file, meta["line_range"], fallback_only=True)
-                payload = f"\nDependency definition Signature for '{sym_name}' (inside '{dep_file}'):\n{content}"
-                if is_debug_mode():
-                    print(f"[DEBUG] [Chunker] Token budget approaching threshold. Compiling '{sym_name}' using Fallback Signatures only.")
+                content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=True)
+                payload = f"\nDependency definition Signature for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
+            else:
+                payload = f"\nDependency definition for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
                 
             bundle_lines.append(payload)
             accumulated_chars += len(payload)

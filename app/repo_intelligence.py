@@ -39,18 +39,33 @@ class RepoIndexer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
-        if node.module:
-            self.imports.append(node.module)
+        # Handle relative imports (from .ctx import AppContext or from . import cli)
+        if node.level and node.level > 0:
+            parts = self.filepath.replace("\\", "/").split("/")
+            # Verify we do not traverse out of the repository bounds
+            if len(parts) >= node.level:
+                dir_parts = parts[:-node.level]
+                if node.module:
+                    # e.g., from .ctx -> src/flask/ctx
+                    resolved_path = "/".join(dir_parts + [node.module])
+                    import_name = resolved_path.replace("/", ".")
+                    self.imports.append(import_name)
+                else:
+                    # e.g., from . import cli -> src/flask/cli
+                    for alias in node.names:
+                        resolved_path = "/".join(dir_parts + [alias.name])
+                        import_name = resolved_path.replace("/", ".")
+                        self.imports.append(import_name)
+        else:
+            # Standard absolute imports (import os, from django.conf import settings)
+            if node.module:
+                self.imports.append(node.module)
         self.generic_visit(node)
 
 def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
-    """
-    Scans the repository folder and indexes symbols and file dependencies.
-    """
     symbol_index = {}
     dependency_graph = {}
     
-    # Normalize path
     repo_path = Path(repo_dir).resolve()
     
     for root, _, files in os.walk(repo_path):
@@ -61,7 +76,6 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
             full_path = Path(root) / file
             rel_path = str(full_path.relative_to(repo_path))
             
-            # Skip virtual environments and common ignored directories
             if any(p in f"/{rel_path}/" for p in ["/.venv/", "/node_modules/", "/.git/", "/build/"]):
                 continue
                 
@@ -72,7 +86,6 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
                 indexer = RepoIndexer(rel_path)
                 indexer.visit(tree)
                 
-                # Append symbols
                 for sym in indexer.symbols:
                     symbol_index[sym["name"]] = {
                         "file_path": sym["file_path"],
@@ -87,13 +100,18 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
             except Exception as e:
                 print(f"Failed parsing file: {rel_path}. Error: {e}")
 
-    # Build the inverted imported_by lookup
+    # Prevent writing empty index files if the clone directory was empty/failed
+    if not symbol_index and not dependency_graph:
+        print("[RepoIntel] Warning: No source files located. Aborting write to prevent caching corrupt empty index.")
+        return ""
+
     for filepath, data in list(dependency_graph.items()):
         for imp in data["imports"]:
-            # Basic matching (e.g., if we import "app.database", match "app/database.py")
             imp_path = imp.replace(".", "/") + ".py"
-            if imp_path in dependency_graph:
-                dependency_graph[imp_path]["imported_by"].append(filepath)
+            for potential_match in dependency_graph.keys():
+                if potential_match.endswith(imp_path):
+                    dependency_graph[potential_match]["imported_by"].append(filepath)
+                    break
 
     INTEL_DIR.mkdir(parents=True, exist_ok=True)
     out_file = INTEL_DIR / f"{commit_sha}.json"

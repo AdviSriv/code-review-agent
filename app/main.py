@@ -1,13 +1,17 @@
+import os
 import sys
 import argparse
 import requests
 import json
 import threading
 import time
+import subprocess
+import shutil
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Config and parsers
-from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode  # <--- Updated Import
+from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode
 from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
 from app.prompt_builder import chunk_file_diffs
 import app.llm_client as llm_client
@@ -80,17 +84,109 @@ def post_github_review(owner: str, repo: str, pr_number: str, token: str, commit
         "Accept": "application/vnd.github.v3+json",
         "Content-Type": "application/json"
     }
-    payload = {
-        "commit_id": commit_id,
-        "event": "COMMENT",
-        "body": body_summary,
-        "comments": comments
-    }
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code not in [200, 201]:
-        print(f"Failed to post grouped review. Status: {response.status_code}, Info: {response.text}")
+    
+    MAX_COMMENTS_PER_BATCH = 8
+    
+    if not comments:
+        payload = {
+            "commit_id": commit_id,
+            "event": "COMMENT",
+            "body": body_summary,
+            "comments": []
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code not in [200, 201]:
+            print(f"Failed to post review. Status: {response.status_code}, Info: {response.text}")
+        else:
+            print("Summary review posted successfully.")
+        return
+
+    comment_batches = [comments[i:i + MAX_COMMENTS_PER_BATCH] for i in range(0, len(comments), MAX_COMMENTS_PER_BATCH)]
+    print(f"[Publisher] Splitting review into {len(comment_batches)} paced batches of max {MAX_COMMENTS_PER_BATCH} inline comments to satisfy API rate limits.")
+    
+    for idx, batch in enumerate(comment_batches, 1):
+        batch_body = body_summary if idx == 1 else f"### 🛡️ Phase 2 Inline Code Review [Batch {idx}/{len(comment_batches)}]"
+        
+        payload = {
+            "commit_id": commit_id,
+            "event": "COMMENT",
+            "body": batch_body,
+            "comments": batch
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        
+        if response.status_code not in [200, 201]:
+            print(f"[Publisher] Failed to post batch {idx}. Status: {response.status_code}, Info: {response.text}")
+            if response.status_code in [403, 429]:
+                print("[Publisher] Hit secondary rate limits mid-write. Sleeping for 10s before retry...")
+                time.sleep(10.0)
+                response = requests.post(url, headers=headers, json=payload)
+                if response.status_code not in [200, 201]:
+                    print(f"[Publisher] Retry failed for batch {idx}. Skipping this batch.")
+        else:
+            print(f"[Publisher] Inline Comment Batch {idx}/{len(comment_batches)} submitted successfully.")
+        
+        if idx < len(comment_batches):
+            time.sleep(2.0)
+
+def ensure_local_checkout(owner: str, repo_name: str, commit_sha: str, token: str) -> str:
+    """
+    Dynamically clones or updates a local copy of the target repository 
+    and checks out the specified commit SHA. Returns the path to the workspace root.
+    """
+    cache_dir = Path.home() / ".cache" / "code_review_agent" / "repos" / owner / repo_name
+    workspace_path = str(cache_dir)
+    
+    if cache_dir.exists() and not (cache_dir / ".git").exists():
+        print(f"[Workspace] Cleaning up invalid/empty clone directory: {workspace_path}")
+        try:
+            shutil.rmtree(cache_dir)
+        except Exception as e:
+            print(f"[Workspace] Failed to clean directory: {e}")
+            
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    if not (cache_dir / ".git").exists():
+        print(f"[Workspace] Cloning repository '{owner}/{repo_name}' dynamically...")
+        clone_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+        res = subprocess.run(["git", "clone", clone_url, workspace_path], capture_output=True, text=True)
+        
+        if res.returncode != 0:
+            print(f"[Workspace] Authenticated clone failed: {res.stderr.strip()}")
+            print("[Workspace] Attempting fallback clone as a public repository (no token)...")
+            
+            try:
+                shutil.rmtree(cache_dir)
+            except Exception:
+                pass
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            public_url = f"https://github.com/{owner}/{repo_name}.git"
+            res = subprocess.run(["git", "clone", public_url, workspace_path], capture_output=True, text=True)
+            
+            if res.returncode != 0:
+                try:
+                    shutil.rmtree(cache_dir)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Clone failed under both authenticated and public scopes: {res.stderr.strip()}")
     else:
-        print("Grouped Pull Request review posted successfully.")
+        subprocess.run(["git", "reset", "--hard"], cwd=workspace_path, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=workspace_path, capture_output=True)
+        res = subprocess.run(["git", "fetch", "origin"], cwd=workspace_path, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[Workspace] Fetch failed: {res.stderr.strip()}")
+            
+    print(f"[Workspace] Checking out commit '{commit_sha}'...")
+    res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
+    if res.returncode != 0:
+        subprocess.run(["git", "fetch", "--unshallow"], cwd=workspace_path, capture_output=True)
+        res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Checkout failed completely: {res.stderr.strip()}")
+            
+    return workspace_path
 
 def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, get_lines_limit: int = 2):
     print(f"\n[Pipeline] Initializing Review for {repo_full_name} PR #{pr_number}")
@@ -115,9 +211,46 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, 
         commit_id = pr_data.get("head", {}).get("sha")
         base_sha = pr_data.get("base", {}).get("sha")
         
-        # 2. Fetch modified files
+        # --- Dynamic Local Workspace Resolution ---
+        workspace_path = ensure_local_checkout(owner, repo, commit_id, token)
+        
+        # Configure tool fallback variables and register workspace path
+        llm_client._context["owner"] = owner
+        llm_client._context["repo"] = repo
+        llm_client._context["token"] = token
+        llm_client._context["commit_sha"] = commit_id
+        llm_client._context["workspace"] = workspace_path
+        llm_client._gatekeeper_ref = gatekeeper
+        llm_client.reset_telemetry_counters(get_lines_limit)
+        
+        # 2. Ensure base commit is checked out and indexed dynamically
+        intel_data = load_repo_intelligence(base_sha)
+        
+        # If the index is empty/corrupt, delete and force rebuild
+        if not intel_data.get("symbol_index") or not intel_data.get("dependency_graph"):
+            print(f"[RepoIntel] Index for base commit '{base_sha}' is missing or empty. Forcing checkout and rebuild...")
+            
+            # Clean up corrupted blank index file from disk if it exists
+            intel_file = Path.home() / ".config" / "code_review_agent" / "repo_intel" / f"{base_sha}.json"
+            if intel_file.exists():
+                try:
+                    os.remove(intel_file)
+                except Exception:
+                    pass
+            
+            ensure_local_checkout(owner, repo, base_sha, token)
+            build_repo_intelligence(workspace_path, base_sha)
+            
+            # Checkout HEAD commit again to continue review pipeline
+            ensure_local_checkout(owner, repo, commit_id, token)
+            intel_data = load_repo_intelligence(base_sha)
+            
+        symbol_index = intel_data.get("symbol_index", {})
+        dependency_graph = intel_data.get("dependency_graph", {})
+        
+        # 3. Fetch modified files
         pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
-        changed_file_paths = [f.get("filename") for f in pr_files]
+        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
         
         # --- Module B: Triage Gate ---
         if evaluate_docs_only_skip(changed_file_paths):
@@ -125,30 +258,19 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, 
             post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains documentation, configurations, or lockfiles only.")
             return
             
+        # Run syntax compile and linter check inside the active workspace
+        os.chdir(workspace_path)
         compile_status = run_native_compile_check(changed_file_paths)
         if not compile_status["passed"]:
-            print("[Pipeline] Triage: Skipped due to compilation syntax errors.")
+            print("[Pipeline] Triage: Skipped due to compilation syntax/linter errors.")
             post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
             return
             
-        # Initialize Context, Telemetry, and Gatekeeper pointers
-        llm_client._context["owner"] = owner
-        llm_client._context["repo"] = repo
-        llm_client._context["token"] = token
-        llm_client._context["commit_sha"] = commit_id
-        llm_client._gatekeeper_ref = gatekeeper
-        llm_client.reset_telemetry_counters(get_lines_limit)
-        
-        # Load Module A indices
-        intel_data = load_repo_intelligence(base_sha)
-        symbol_index = intel_data.get("symbol_index", {})
-        dependency_graph = intel_data.get("dependency_graph", {})
-        
         all_comments = []
         total_diff_lines = 0
         conventions = get_repo_conventions(owner, repo, token)
         
-        # 3. Process changes per file
+        # 4. Process changes per file
         for f in pr_files:
             filename = f.get("filename")
             patch = f.get("patch")
@@ -192,7 +314,7 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, 
                 validated_comments = validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
                 all_comments.extend(validated_comments)
 
-        # 4. Programmatic Zero-LLM commit conventions validation
+        # 6. Programmatic Zero-LLM commit conventions validation
         commit_suggestions = fetch_and_validate_commits(owner, repo, pr_number, token)
         gh_comments = build_github_review_payload(all_comments)
         
@@ -346,6 +468,7 @@ def main():
             
             for chunk in chunks:
                 try:
+                    # Pass conventions directly into the offline orchestrator path
                     comments = orchestrate_chunk_review(chunk, conventions, symbol_index={})
                     all_comments.extend(comments)
                 except Exception as e:

@@ -1,7 +1,8 @@
 import os
 
 IGNORED_EXTENSIONS = {
-    '.txt','.md', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.woff', '.woff2', '.ttf', '.eot'
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.woff', '.woff2', '.ttf', '.eot',
+    '.md', '.txt'
 }
 
 IGNORED_FILENAMES = {
@@ -63,12 +64,12 @@ def identify_language(filepath: str) -> str:
 def parse_patch(patch_str: str) -> dict:
     """
     Parses a single file's patch block.
-    Maps line numbers to the specific diff position index (required by GitHub API).
     """
     added_lines = {}
     context_lines = {}
     line_to_position = {}
     position_to_line = {}
+    valid_positions = set()  # Track 100% of valid patch offsets (including deletions)
     hunks = []
     
     if not patch_str:
@@ -77,6 +78,7 @@ def parse_patch(patch_str: str) -> dict:
             'context_lines': context_lines,
             'line_to_position': line_to_position,
             'position_to_line': position_to_line,
+            'valid_positions': valid_positions,
             'hunks': hunks
         }
         
@@ -100,9 +102,10 @@ def parse_patch(patch_str: str) -> dict:
             
             if not first_hunk_seen:
                 first_hunk_seen = True
-                diff_position = 0  # Position starts at 1 for the line immediately below the first @@
+                diff_position = 0
             else:
-                diff_position += 1  # Subsequent @@ headers increment the diff position index
+                diff_position += 1
+                valid_positions.add(diff_position)
                 
             current_hunk = {
                 'header': line,
@@ -113,6 +116,7 @@ def parse_patch(patch_str: str) -> dict:
             
         if first_hunk_seen:
             diff_position += 1
+            valid_positions.add(diff_position)
             if line.startswith('+'):
                 content = line[1:]
                 added_lines[new_line_num] = content
@@ -135,12 +139,13 @@ def parse_patch(patch_str: str) -> dict:
         'context_lines': context_lines,
         'line_to_position': line_to_position,
         'position_to_line': position_to_line,
+        'valid_positions': valid_positions,
         'hunks': hunks
     }
 
 def parse_full_diff(diff_text: str) -> dict:
     """
-    Parses a combined multi-file unified git diff (re-uses patch logic for offline execution compatibility).
+    Parses a combined multi-file unified git diff.
     """
     files = {}
     lines = diff_text.splitlines()
