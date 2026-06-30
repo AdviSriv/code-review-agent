@@ -1,117 +1,173 @@
 import os
-import ast
 import json
 import argparse
+import sqlite3
+import subprocess
 from pathlib import Path
+from app.config import is_debug_mode
 
 INTEL_DIR = Path.home() / ".config" / "code_review_agent" / "repo_intel"
 
-class RepoIndexer(ast.NodeVisitor):
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        self.symbols = []
-        self.imports = []
-
-    def visit_ClassDef(self, node):
-        self.symbols.append({
-            "name": node.name,
-            "type": "class",
-            "file_path": self.filepath,
-            "line_range": [node.lineno, getattr(node, "end_lineno", node.lineno)]
-        })
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        self.symbols.append({
-            "name": node.name,
-            "type": "function",
-            "file_path": self.filepath,
-            "line_range": [node.lineno, getattr(node, "end_lineno", node.lineno)]
-        })
-        self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self.visit_FunctionDef(node)
-
-    def visit_Import(self, node):
-        for name in node.names:
-            self.imports.append(name.name)
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node):
-        # Handle relative imports (from .ctx import AppContext or from . import cli)
-        if node.level and node.level > 0:
-            parts = self.filepath.replace("\\", "/").split("/")
-            # Verify we do not traverse out of the repository bounds
-            if len(parts) >= node.level:
-                dir_parts = parts[:-node.level]
-                if node.module:
-                    # e.g., from .ctx -> src/flask/ctx
-                    resolved_path = "/".join(dir_parts + [node.module])
-                    import_name = resolved_path.replace("/", ".")
-                    self.imports.append(import_name)
-                else:
-                    # e.g., from . import cli -> src/flask/cli
-                    for alias in node.names:
-                        resolved_path = "/".join(dir_parts + [alias.name])
-                        import_name = resolved_path.replace("/", ".")
-                        self.imports.append(import_name)
-        else:
-            # Standard absolute imports (import os, from django.conf import settings)
-            if node.module:
-                self.imports.append(node.module)
-        self.generic_visit(node)
+def make_rel(path_str: str, base_dir: str) -> str:
+    """
+    Safely converts an absolute path string to a relative path string 
+    relative to base_dir, normalizing all slashes.
+    """
+    if not path_str:
+        return ""
+    try:
+        rel = os.path.relpath(path_str, base_dir)
+        return rel.replace("\\", "/")
+    except ValueError:
+        return path_str.replace("\\", "/")
 
 def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
-    symbol_index = {}
-    dependency_graph = {}
-    
+    """
+    Invokes code-review-graph (CRG) to index the repository. Leverages sub-second 
+    incremental updates if a database is already present.
+    """
     repo_path = Path(repo_dir).resolve()
+    repo_path_str = str(repo_path)
+    db_path = repo_path / ".code-review-graph" / "graph.db"
     
-    for root, _, files in os.walk(repo_path):
-        for file in files:
-            if not file.endswith(".py"):
-                continue
-                
-            full_path = Path(root) / file
-            rel_path = str(full_path.relative_to(repo_path))
+    print(f"[RepoIntel] Building repository intelligence for Commit: {commit_sha} inside {repo_path}")
+    
+    # Stream subprocess outputs directly to standard terminal streams if debug is enabled
+    stdout_dest = None if is_debug_mode() else subprocess.PIPE
+    stderr_dest = None if is_debug_mode() else subprocess.PIPE
+    
+    try:
+        if db_path.exists():
+            print(f"[RepoIntel] Database found at {db_path}. Executing fast incremental update...", flush=True)
+            res = subprocess.run(
+                ["code-review-graph", "update"], 
+                cwd=repo_path_str, 
+                stdout=stdout_dest, 
+                stderr=stderr_dest, 
+                text=True
+            )
+        else:
+            print(f"[RepoIntel] No database found. Executing full codebase build...", flush=True)
+            res = subprocess.run(
+                ["code-review-graph", "build"], 
+                cwd=repo_path_str, 
+                stdout=stdout_dest, 
+                stderr=stderr_dest, 
+                text=True
+            )
             
-            if any(p in f"/{rel_path}/" for p in ["/.venv/", "/node_modules/", "/.git/", "/build/"]):
-                continue
-                
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                    tree = ast.parse(f.read(), filename=str(full_path))
-                
-                indexer = RepoIndexer(rel_path)
-                indexer.visit(tree)
-                
-                for sym in indexer.symbols:
-                    symbol_index[sym["name"]] = {
-                        "file_path": sym["file_path"],
-                        "line_range": sym["line_range"],
-                        "type": sym["type"]
-                    }
-                
-                dependency_graph[rel_path] = {
-                    "imports": indexer.imports,
-                    "imported_by": []
-                }
-            except Exception as e:
-                print(f"Failed parsing file: {rel_path}. Error: {e}")
-
-    # Prevent writing empty index files if the clone directory was empty/failed
-    if not symbol_index and not dependency_graph:
-        print("[RepoIntel] Warning: No source files located. Aborting write to prevent caching corrupt empty index.")
+        if res.returncode != 0:
+            print(f"[RepoIntel] code-review-graph command failed with exit code: {res.returncode}")
+    except Exception as e:
+        print(f"[RepoIntel] Failed to execute code-review-graph CLI operation: {e}")
         return ""
 
-    for filepath, data in list(dependency_graph.items()):
-        for imp in data["imports"]:
-            imp_path = imp.replace(".", "/") + ".py"
-            for potential_match in dependency_graph.keys():
-                if potential_match.endswith(imp_path):
-                    dependency_graph[potential_match]["imported_by"].append(filepath)
-                    break
+    if not db_path.exists():
+        print(f"[RepoIntel] Error: SQLite graph database not found at {db_path}")
+        return ""
+
+    symbol_index = {}
+    dependency_graph = {}
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Extract nodes to build the symbol index
+        cursor.execute("""
+            SELECT name, qualified_name, file_path, line_start, line_end, kind 
+            FROM nodes 
+            WHERE kind != 'File'
+        """)
+        nodes = cursor.fetchall()
+        for node in nodes:
+            line_range = [node["line_start"] or 1, node["line_end"] or 1]
+            rel_file = make_rel(node["file_path"], repo_path_str)
+            
+            qual_name = node["qualified_name"]
+            if "::" in qual_name:
+                parts = qual_name.split("::", 1)
+                rel_part = make_rel(parts[0], repo_path_str)
+                qual_name = f"{rel_part}::{parts[1]}"
+            else:
+                qual_name = make_rel(qual_name, repo_path_str)
+                
+            symbol_meta = {
+                "file_path": rel_file,
+                "line_range": line_range,
+                "type": node["kind"].lower()
+            }
+            symbol_index[qual_name] = symbol_meta
+
+        # Extract all files to seed the dependency graph
+        cursor.execute("SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL")
+        files = cursor.fetchall()
+        for f in files:
+            rel_f = make_rel(f["file_path"], repo_path_str)
+            dependency_graph[rel_f] = {
+                "imports": [],
+                "imported_by": []
+            }
+
+        node_to_file = {}
+        cursor.execute("SELECT qualified_name, file_path FROM nodes WHERE file_path IS NOT NULL")
+        for row in cursor.fetchall():
+            node_to_file[row["qualified_name"]] = row["file_path"]
+
+        # Extract import relations using qualified names mapped back to relative file paths
+        cursor.execute("""
+            SELECT 
+                e.source_qualified,
+                e.target_qualified,
+                n_src.file_path AS src_file,
+                n_tgt.file_path AS tgt_file
+            FROM edges e
+            LEFT JOIN nodes n_src ON e.source_qualified = n_src.qualified_name
+            LEFT JOIN nodes n_tgt ON e.target_qualified = n_tgt.qualified_name
+            WHERE e.kind IN ('IMPORTS_FROM', 'DEPENDS_ON')
+        """)
+        edges = cursor.fetchall()
+        for edge in edges:
+            src_file_abs = edge["src_file"] or node_to_file.get(edge["source_qualified"])
+            tgt_file_abs = edge["tgt_file"] or node_to_file.get(edge["target_qualified"])
+
+            if src_file_abs and tgt_file_abs:
+                src_file = make_rel(src_file_abs, repo_path_str)
+                tgt_file = make_rel(tgt_file_abs, repo_path_str)
+                
+                if src_file != tgt_file:
+                    dependency_graph.setdefault(src_file, {"imports": [], "imported_by": []})
+                    dependency_graph.setdefault(tgt_file, {"imports": [], "imported_by": []})
+
+                    if tgt_file not in dependency_graph[src_file]["imports"]:
+                        dependency_graph[src_file]["imports"].append(tgt_file)
+                    if src_file not in dependency_graph[tgt_file]["imported_by"]:
+                        dependency_graph[tgt_file]["imported_by"].append(src_file)
+
+                    if tgt_file.endswith(".py"):
+                        dot_tgt = tgt_file[:-3].replace("/", ".")
+                    else:
+                        dot_tgt = tgt_file.replace("/", ".")
+                        
+                    if src_file.endswith(".py"):
+                        dot_src = src_file[:-3].replace("/", ".")
+                    else:
+                        dot_src = src_file.replace("/", ".")
+
+                    if dot_tgt not in dependency_graph[src_file]["imports"]:
+                        dependency_graph[src_file]["imports"].append(dot_tgt)
+                    if dot_src not in dependency_graph[tgt_file]["imported_by"]:
+                        dependency_graph[tgt_file]["imported_by"].append(dot_src)
+
+        conn.close()
+    except Exception as e:
+        print(f"[RepoIntel] Failed to process database nodes and edges: {e}")
+        return ""
+
+    if not symbol_index and not dependency_graph:
+        print("[RepoIntel] Warning: Empty symbol index. Aborting write.")
+        return ""
 
     INTEL_DIR.mkdir(parents=True, exist_ok=True)
     out_file = INTEL_DIR / f"{commit_sha}.json"
@@ -125,7 +181,7 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
     with open(out_file, "w") as f:
         json.dump(payload, f, indent=4)
         
-    print(f"Repo Intelligence generated successfully for Commit: {commit_sha}")
+    print(f"Repo Intelligence generated successfully via CRG for Commit: {commit_sha}")
     return str(out_file)
 
 def load_repo_intelligence(commit_sha: str) -> dict:

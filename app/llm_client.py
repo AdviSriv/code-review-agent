@@ -4,7 +4,7 @@ import threading
 import requests
 from google import genai
 from google.genai import types
-from app.config import get_secret, is_debug_mode  # <--- Updated Import
+from app.config import get_secret, is_debug_mode
 
 _context = {
     "owner": "",
@@ -42,7 +42,6 @@ def get_lines(file: str, start: int, end: int) -> str:
 
     content = ""
     
-    # 1. Resolve path within the dynamic workspace if configured
     workspace = _context.get("workspace")
     target_path = os.path.join(workspace, file) if workspace else file
     
@@ -56,7 +55,6 @@ def get_lines(file: str, start: int, end: int) -> str:
         except Exception:
             pass
             
-    # 2. Remote API Fallback
     if not content:
         owner = _context.get("owner")
         repo = _context.get("repo")
@@ -101,6 +99,9 @@ def reset_telemetry_counters(limit: int = 2):
     with _lock:
         get_lines_counter = 0
         get_lines_limit = limit
+
+def reset_token_stats():
+    with _lock:
         token_stats["prompt_tokens"] = 0
         token_stats["candidates_tokens"] = 0
         token_stats["total_tokens"] = 0
@@ -113,18 +114,30 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     client = genai.Client(api_key=api_key)
     model_name = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
     
-    config = types.GenerateContentConfig(
-        temperature=0.1,
-        system_instruction=system_instruction,
-        tools=[get_lines]
-    )
+    config_kwargs = {
+        "temperature": 0.1,
+        "system_instruction": system_instruction,
+    }
+    
+    if response_schema is not None:
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = response_schema
+    else:
+        config_kwargs["tools"] = [get_lines]
+        
+    config = types.GenerateContentConfig(**config_kwargs)
     
     max_retries = 3
-    retry_delay = 3
+    retry_delay = 5
     
     if is_debug_mode():
-        print(f"[DEBUG] [LLM Client] Sending generation call to model '{model_name}' (Payload size: {len(prompt)} chars).")
+        # Display the full input context being sent to the LLM
+        print("\n" + "="*40 + " LLM PROMPT INPUT " + "="*40, flush=True)
+        print(f"[System Instruction]\n{system_instruction}\n", flush=True)
+        print(f"[Prompt Payload]\n{prompt}", flush=True)
+        print("="*98 + "\n", flush=True)
         
+    response = None
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -135,24 +148,31 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
             break
         except Exception as e:
             error_str = str(e)
-            is_transient = "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_transient = (
+                "503" in error_str or 
+                "429" in error_str or 
+                "UNAVAILABLE" in error_str or 
+                "RESOURCE_EXHAUSTED" in error_str or
+                "quota" in error_str.lower()
+            )
             
             if is_transient and attempt < max_retries - 1:
-                print(f"[LLM Client] Transient error encountered ({error_str.splitlines()[0]}). Retrying in {retry_delay} seconds...")
+                print(f"[LLM Client] Quota/Transient error on attempt {attempt+1}. Retrying in {retry_delay} seconds... Error: {error_str.splitlines()[0]}")
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
                 raise e
     
-    if not response.text:
+    if not response or not response.text:
         raise RuntimeError("LLM returned an empty response.")
         
     usage = response.usage_metadata
     if usage:
-        token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
-        token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
-        token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
-        if is_debug_mode():
-            print(f"[DEBUG] [LLM Client] Call finished. Tokens used in turn: {getattr(usage, 'total_token_count', 0)}")
+        with _lock:
+            token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
+            token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+            token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
+            if is_debug_mode():
+                print(f"[DEBUG] [LLM Client] Call finished. Tokens used in turn: {getattr(usage, 'total_token_count', 0)}", flush=True)
         
     return response.text

@@ -11,15 +11,14 @@ DEFAULT_CONFIG = {
     "MAX_RPM": 12,
     "MAX_TPM": 200000,
     "MAX_RPD": 400,
-    "DEP_TOKEN_BUDGET": 1500,
+    "DEP_TOKEN_BUDGET": 5000,  # Calibrated for 4vCPU/8GB limits with 2 active roles
     "CHUNK_TOKEN_TARGET": 5000,
     "MAX_ESCALATION_RETRIES": 1,
     "MAX_ROUTER_CALLS_PER_CHUNK": 1,
     "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"]
 }
 
-# Global trace state variable
-_debug_mode = False
+_debug_mode = True
 
 def set_debug_mode(enabled: bool):
     global _debug_mode
