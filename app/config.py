@@ -11,11 +11,12 @@ DEFAULT_CONFIG = {
     "MAX_RPM": 12,
     "MAX_TPM": 200000,
     "MAX_RPD": 400,
-    "DEP_TOKEN_BUDGET": 5000,  # Calibrated for 4vCPU/8GB limits with 2 active roles
+    "DEP_TOKEN_BUDGET": 5000,  
     "CHUNK_TOKEN_TARGET": 5000,
     "MAX_ESCALATION_RETRIES": 1,
     "MAX_ROUTER_CALLS_PER_CHUNK": 1,
-    "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"]
+    "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"],
+    "ENABLE_STATIC_BASELINE": True  # Toggle to include/exclude default static analysis baseline warnings
 }
 
 _debug_mode = True
@@ -41,15 +42,30 @@ def get_config() -> dict:
                 data.setdefault(k, v)
             return data
     except Exception:
-        return DEFAULT_CONFIG
+        return dict(DEFAULT_CONFIG)
 
 def save_config(data: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    current_data = get_config()
+    
+    # Directly read existing values from file if it exists, bypass get_config() dependency
+    current_data = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                current_data = json.load(f)
+        except Exception:
+            current_data = dict(DEFAULT_CONFIG)
+    else:
+        current_data = dict(DEFAULT_CONFIG)
+        
     current_data.update(data)
     with open(CONFIG_FILE, "w") as f:
         json.dump(current_data, f, indent=4)
-    os.chmod(CONFIG_FILE, 0o600)
+        
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
 
 def get_secret(key: str) -> str:
     val = os.getenv(key)

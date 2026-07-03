@@ -1,6 +1,7 @@
 import re
 from app.models import CodeComment
 
+# Mapping validation metrics
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 REPORT_THRESHOLD = SEVERITY_RANK["P2"]
 CONFIDENCE_THRESHOLD = 0.6
@@ -32,7 +33,7 @@ def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_dif
             if not is_identifier_grounded(f.comment, parsed_diff_file):
                 old_sev = f.severity
                 f.severity = {"P0": "P1", "P1": "P2", "P2": "P3", "P3": "P3"}.get(f.severity, "P3")
-                print(f"[Validator] Ungrounded symbol reference. Demoted {old_sev} -> {f.severity}.")
+                print(f"[Validator] Ungrounded symbol reference at position {f.position}. Demoted {old_sev} -> {f.severity}.")
         if SEVERITY_RANK.get(f.severity, 99) > REPORT_THRESHOLD:
             continue
         valid_comments.append(f)

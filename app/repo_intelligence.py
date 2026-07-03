@@ -3,8 +3,10 @@ import json
 import argparse
 import sqlite3
 import subprocess
+import shutil
 from pathlib import Path
 from app.config import is_debug_mode
+from app.profiler import PipelineProfiler
 
 INTEL_DIR = Path.home() / ".config" / "code_review_agent" / "repo_intel"
 
@@ -26,16 +28,18 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
     Invokes code-review-graph (CRG) to index the repository. Leverages sub-second 
     incremental updates if a database is already present.
     """
+    profiler = PipelineProfiler()
     repo_path = Path(repo_dir).resolve()
     repo_path_str = str(repo_path)
     db_path = repo_path / ".code-review-graph" / "graph.db"
     
     print(f"[RepoIntel] Building repository intelligence for Commit: {commit_sha} inside {repo_path}")
     
-    # Stream subprocess outputs directly to standard terminal streams if debug is enabled
     stdout_dest = None if is_debug_mode() else subprocess.PIPE
     stderr_dest = None if is_debug_mode() else subprocess.PIPE
     
+    # Profile external CLI tool executions
+    profiler.start("RepoIntel: code-review-graph CLI")
     try:
         if db_path.exists():
             print(f"[RepoIntel] Database found at {db_path}. Executing fast incremental update...", flush=True)
@@ -60,7 +64,9 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
             print(f"[RepoIntel] code-review-graph command failed with exit code: {res.returncode}")
     except Exception as e:
         print(f"[RepoIntel] Failed to execute code-review-graph CLI operation: {e}")
+        profiler.stop("RepoIntel: code-review-graph CLI")
         return ""
+    profiler.stop("RepoIntel: code-review-graph CLI")
 
     if not db_path.exists():
         print(f"[RepoIntel] Error: SQLite graph database not found at {db_path}")
@@ -69,12 +75,13 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
     symbol_index = {}
     dependency_graph = {}
 
+    # Profile parsing the AST graph tables inside SQLite
+    profiler.start("RepoIntel: DB Node/Edge Parsing")
     try:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # Extract nodes to build the symbol index
         cursor.execute("""
             SELECT name, qualified_name, file_path, line_start, line_end, kind 
             FROM nodes 
@@ -100,7 +107,6 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
             }
             symbol_index[qual_name] = symbol_meta
 
-        # Extract all files to seed the dependency graph
         cursor.execute("SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL")
         files = cursor.fetchall()
         for f in files:
@@ -115,7 +121,6 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
         for row in cursor.fetchall():
             node_to_file[row["qualified_name"]] = row["file_path"]
 
-        # Extract import relations using qualified names mapped back to relative file paths
         cursor.execute("""
             SELECT 
                 e.source_qualified,
@@ -163,7 +168,9 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
         conn.close()
     except Exception as e:
         print(f"[RepoIntel] Failed to process database nodes and edges: {e}")
+        profiler.stop("RepoIntel: DB Node/Edge Parsing")
         return ""
+    profiler.stop("RepoIntel: DB Node/Edge Parsing")
 
     if not symbol_index and not dependency_graph:
         print("[RepoIntel] Warning: Empty symbol index. Aborting write.")
@@ -171,6 +178,15 @@ def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
 
     INTEL_DIR.mkdir(parents=True, exist_ok=True)
     out_file = INTEL_DIR / f"{commit_sha}.json"
+    
+    # Save a permanent copy of the SQLite database inside the cache folder
+    cache_db_file = INTEL_DIR / f"{commit_sha}.db"
+    if db_path.exists():
+        try:
+            shutil.copy(str(db_path), str(cache_db_file))
+            print(f"[RepoIntel] Saved database copy to {cache_db_file}", flush=True)
+        except Exception as e:
+            print(f"[RepoIntel] Failed to copy database to cache: {e}", flush=True)
     
     payload = {
         "commit_sha": commit_sha,

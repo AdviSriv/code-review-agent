@@ -1,3 +1,4 @@
+# ===== /root/code-review-agent/app/main.py =====
 import os
 import sys
 import argparse
@@ -9,6 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor
 
 # Config and parsers
 from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode
@@ -17,7 +19,7 @@ from app.prompt_builder import chunk_file_diffs
 import app.llm_client as llm_client
 from app.models import CodeComment
 from app.output_parser import build_github_review_payload
-from app.repo_checks import get_repo_conventions, fetch_and_validate_commits
+from app.repo_checks import get_repo_conventions
 
 # Import Phase 2 Modules
 from app.repo_intelligence import load_repo_intelligence, build_repo_intelligence
@@ -31,6 +33,7 @@ from app.orchestrator import (
     get_changed_symbols_in_file
 )
 from app.validator import validate_and_deduplicate_comments
+from app.profiler import PipelineProfiler
 
 gatekeeper = RateGatekeeper()
 
@@ -104,7 +107,6 @@ def ensure_local_checkout(owner: str, repo_name: str, commit_sha: str, token: st
             subprocess.run(["git", "clone", f"https://github.com/{owner}/{repo_name}.git", workspace_path], check=True)
     else:
         subprocess.run(["git", "reset", "--hard"], cwd=workspace_path, capture_output=True)
-        # Exclude .code-review-graph so the compiled SQLite database is preserved across branch checkouts
         subprocess.run(["git", "clean", "-fd", "-e", ".code-review-graph"], cwd=workspace_path, capture_output=True)
         subprocess.run(["git", "fetch", "origin"], cwd=workspace_path, capture_output=True)
     res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
@@ -113,11 +115,15 @@ def ensure_local_checkout(owner: str, repo_name: str, commit_sha: str, token: st
         subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, check=True)
     return workspace_path
 
-def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, get_lines_limit: int = 2):
+def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, max_escalation_rounds: int = 1):
     print(f"\n[Pipeline] Initializing Review for {repo_full_name} PR #{pr_number}", flush=True)
     start_time = time.time()
+    
+    profiler = PipelineProfiler()
+    profiler.start("Pipeline: Full Process Execution")
+    
     try:
-        # Reset token stats globally once per PR run
+        # Reset token telemetry variables once per PR pipeline execution
         llm_client.reset_token_stats()
 
         token = get_repo_pat(repo_full_name)
@@ -125,47 +131,84 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             print(f"[Pipeline] Error: GITHUB_PAT not configured.", flush=True)
             return
         owner, repo = repo_full_name.split("/")
+        
+        # Profile repo metadata parsing
+        profiler.start("GitHub API: Retrieve PR/Repository Metadata")
         repo_meta = fetch_repo_metadata(owner, repo, token)
         repo_size_kb = repo_meta.get("size", 0)
         pr_data = fetch_pr_metadata(owner, repo, pr_number, token)
         if pr_data.get("draft") is True:
+            profiler.stop("GitHub API: Retrieve PR/Repository Metadata")
+            profiler.stop("Pipeline: Full Process Execution")
             return
         commit_id = pr_data.get("head", {}).get("sha")
+        base_sha = pr_data.get("base", {}).get("sha")
+        pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
+        profiler.stop("GitHub API: Retrieve PR/Repository Metadata")
         
+        # Profile Git Checkout of Head Commit
+        profiler.start("Git Checkout: HEAD Commit Retrieval")
         workspace_path = ensure_local_checkout(owner, repo, commit_id, token)
-        llm_client._context.update({"owner": owner, "repo": repo, "token": token, "commit_sha": commit_id, "workspace": workspace_path})
+        profiler.stop("Git Checkout: HEAD Commit Retrieval")
+        
+        # Populate context keys cleanly
+        llm_client._context.update({
+            "owner": owner, 
+            "repo": repo, 
+            "token": token, 
+            "commit_sha": commit_id, 
+            "workspace": workspace_path,
+            "base_sha": base_sha
+        })
         llm_client._gatekeeper_ref = gatekeeper
         
-        # FIX: Build and load intelligence strictly for the HEAD commit (commit_id) instead of the base SHA.
-        # This completely resolves line shifting/symbol misalignment bugs.
+        # Fetch / build the HEAD commit index
+        profiler.start("RepoIntel Build: Head Commit AST Index")
         intel_data = load_repo_intelligence(commit_id)
         if not intel_data.get("symbol_index") or not intel_data.get("dependency_graph"):
             print(f"[RepoIntel] Index for HEAD commit '{commit_id}' is missing. Generating...", flush=True)
             build_repo_intelligence(workspace_path, commit_id)
             intel_data = load_repo_intelligence(commit_id)
+        profiler.stop("RepoIntel Build: Head Commit AST Index")
+            
+        # Also ensure base_sha database is indexed so we can query base callers during deletion escalations
+        profiler.start("RepoIntel Build: Base Commit AST Index")
+        base_intel = load_repo_intelligence(base_sha)
+        if not base_intel.get("symbol_index") or not base_intel.get("dependency_graph"):
+            print(f"[RepoIntel] Index for BASE commit '{base_sha}' is missing. Generating...", flush=True)
+            ensure_local_checkout(owner, repo, base_sha, token)
+            build_repo_intelligence(workspace_path, base_sha)
+            ensure_local_checkout(owner, repo, commit_id, token)
+        profiler.stop("RepoIntel Build: Base Commit AST Index")
             
         symbol_index = intel_data.get("symbol_index", {})
         dependency_graph = intel_data.get("dependency_graph", {})
-        pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
         changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
         
         if evaluate_docs_only_skip(changed_file_paths):
             post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
+            profiler.stop("Pipeline: Full Process Execution")
             return
             
-        os.chdir(workspace_path)
-        compile_status = run_native_compile_check(changed_file_paths)
+        # Profile compilation step using explicit thread-safe cwd pathways (no os.chdir)
+        profiler.start("Triage validation: Local Compilers & Linters")
+        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
+        profiler.stop("Triage validation: Local Compilers & Linters")
+        
         if not compile_status["passed"]:
             post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
+            profiler.stop("Pipeline: Full Process Execution")
             return
             
-        all_comments, total_diff_lines = [], 0
         conventions = get_repo_conventions(owner, repo, token)
         db_path = os.path.join(workspace_path, ".code-review-graph", "graph.db")
         
-        # Instantiate workspace-wide shared cache
+        # Instantiate shared cache context
         cache = SharedContextCache(workspace_path)
+        review_tasks = []
+        total_diff_lines = 0
         
+        # 1. Map changed files to task payloads
         for f in pr_files:
             filename = f.get("filename")
             patch = f.get("patch")
@@ -182,52 +225,70 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             changed_symbols = get_changed_symbols_in_file(db_path, filepath_abs, modified_lines)
             
             if changed_symbols:
-                for idx, sym in enumerate(changed_symbols):
-                    if idx > 0:
-                        time.sleep(2.0)  # Pacing delay to guarantee RPM quota compliance
-                        
-                    llm_client.reset_telemetry_counters(get_lines_limit)
-                    print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
-                    
-                    symbol_comments = orchestrate_symbol_review(
-                        sym, symbol_index, conventions, cache, db_path
-                    )
-                    validated_comments = validate_and_deduplicate_comments(symbol_comments, filename, parsed_diff)
-                    all_comments.extend(validated_comments)
+                for sym in changed_symbols:
+                    review_tasks.append({
+                        "type": "symbol",
+                        "filename": filename,
+                        "parsed_diff": parsed_diff,
+                        "sym": sym
+                    })
             else:
-                # Fallback to standard file-level chunking
                 chunks = chunk_file_diffs(filename, lang, parsed_diff)
                 for chunk in chunks:
                     dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
                     payload = f"{chunk}\n\n{dep_bundle}"
-                    estimated_tokens = int(len(payload) / 4)
-                    
-                    while True:
-                        can_go, wait_time = gatekeeper.can_consume(estimated_tokens)
-                        if can_go:
-                            break
-                        print(f"[Gatekeeper] Quota limits approaching. Waiting {wait_time:.1f}s...", flush=True)
-                        time.sleep(wait_time)
-                    
-                    llm_client.reset_telemetry_counters(get_lines_limit)
-                    print(f"[Pipeline] Analysing file chunks: '{filename}'...", flush=True)
-                    
-                    chunk_comments = orchestrate_chunk_review(payload, conventions, symbol_index)
-                    gatekeeper.record_call(estimated_tokens)
-                    
-                    validated_comments = validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
-                    all_comments.extend(validated_comments)
+                    review_tasks.append({
+                        "type": "chunk",
+                        "filename": filename,
+                        "parsed_diff": parsed_diff,
+                        "payload": payload
+                    })
 
-        commit_suggestions = fetch_and_validate_commits(owner, repo, pr_number, token)
+        # 2. Worker task executor
+        def execute_review_task(task):
+            filename = task["filename"]
+            parsed_diff = task["parsed_diff"]
+            
+            if task["type"] == "symbol":
+                sym = task["sym"]
+                print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
+                symbol_comments = orchestrate_symbol_review(
+                    sym, symbol_index, conventions, cache, db_path,
+                    dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds
+                )
+                return validate_and_deduplicate_comments(symbol_comments, filename, parsed_diff)
+            else:
+                payload = task["payload"]
+                print(f"[Pipeline] Analysing file chunks: '{filename}'...", flush=True)
+                chunk_comments = orchestrate_chunk_review(
+                    payload, conventions, symbol_index, db_path, cache,
+                    max_escalation_rounds=max_escalation_rounds
+                )
+                return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
+
+        # 3. Parallelize the reviews across thread pools safely protected by central RateGatekeeper
+        all_comments = []
+        if review_tasks:
+            profiler.start("Pipeline: Parallel LLM Task Execution")
+            with ThreadPoolExecutor(max_workers=min(len(review_tasks), 4)) as executor:
+                task_results = executor.map(execute_review_task, review_tasks)
+                for res in task_results:
+                    all_comments.extend(res)
+            profiler.stop("Pipeline: Parallel LLM Task Execution")
+
         gh_comments = build_github_review_payload(all_comments)
         summary_body = "### 🛡️ Phase 2 Code Review Complete\n\nAll findings have been batched and mapped directly to lines."
-        if commit_suggestions:
-            summary_body += "\n\n### ⚠️ Commit Message Conventions Suggestions\n" + "\n".join(f"- {s}" for s in commit_suggestions)
                 
-        if gh_comments or commit_suggestions:
+        if gh_comments:
+            profiler.start("GitHub API: Post review comments payload")
             post_github_review(owner, repo, pr_number, token, commit_id, gh_comments, summary_body)
+            profiler.stop("GitHub API: Post review comments payload")
             
         elapsed_time = time.time() - start_time
+        profiler.stop("Pipeline: Full Process Execution")
+        
+        profiler.report()
+        
         print("\n================== PERFORMANCE METRICS ==================", flush=True)
         print(f"Repository size: {repo_size_kb:,} KB" if repo_size_kb else "Repository size: Unknown", flush=True)
         print(f"PR Diff size: {total_diff_lines:,} total lines", flush=True)
@@ -235,39 +296,66 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
         print(f"Tokens consumed:\n  - Input: {llm_client.token_stats['prompt_tokens']:,}\n  - Output: {llm_client.token_stats['candidates_tokens']:,}\n  - Total: {llm_client.token_stats['total_tokens']:,}", flush=True)
         print("=========================================================\n", flush=True)
     except Exception as e:
+        profiler.stop("Pipeline: Full Process Execution")
         print(f"[Pipeline] Crash: {e}", flush=True)
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        print(f"\n[Webhook] Received incoming POST request on '{self.path}'", flush=True)
+        
         if self.path != "/webhook":
+            print(f"[Webhook] Rejected: Path is not '/webhook' (received '{self.path}')", flush=True)
             self.send_response(404)
             self.end_headers()
             return
+            
+        event_type = self.headers.get('X-GitHub-Event', '')
+        print(f"[Webhook] GitHub Event Header ('X-GitHub-Event'): '{event_type}'", flush=True)
+        
         post_data = self.rfile.read(int(self.headers.get('Content-Length', 0) or 0))
         try:
-            if self.headers.get('X-GitHub-Event', '') != 'pull_request':
-                self.send_response(200)
-                self.end_headers()
-                return
             payload = json.loads(post_data.decode('utf-8'))
-            if payload.get("action") not in ["opened", "synchronize", "ready_for_review"] or payload.get("pull_request", {}).get("draft") is True:
-                self.send_response(200)
-                self.end_headers()
-                return
-            repo_full_name = payload.get("repository", {}).get("full_name")
-            pr_number = payload.get("number")
-            if repo_full_name and pr_number:
-                self.send_response(202)
-                self.end_headers()
-                threading.Thread(target=run_review_pipeline, args=(repo_full_name, str(pr_number), server_dep_hops, server_lines_limit)).start()
-            else:
-                self.send_response(400)
-                self.end_headers()
-        except Exception:
-            self.send_response(500)
+        except Exception as e:
+            print(f"[Webhook] Error: Failed to parse JSON payload: {e}", flush=True)
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        if event_type == 'ping':
+            print("[Webhook] Received 'ping' event from GitHub. Connection is healthy!", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+
+        if event_type != 'pull_request':
+            print(f"[Webhook] Ignored: Event is not 'pull_request' (received '{event_type}')", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+            
+        action = payload.get("action")
+        is_draft = payload.get("pull_request", {}).get("draft", False)
+        print(f"[Webhook] Pull Request Action parsed correctly: '{action}', Draft: {is_draft}", flush=True)
+        
+        if action not in ["opened", "synchronize", "ready_for_review"] or is_draft is True:
+            print(f"[Webhook] Ignored: Action '{action}' is not tracked or PR is currently in draft.", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+            
+        repo_full_name = payload.get("repository", {}).get("full_name")
+        pr_number = payload.get("number")
+        if repo_full_name and pr_number:
+            print(f"[Webhook] Triggering PR review pipeline for '{repo_full_name}' PR #{pr_number}", flush=True)
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=run_review_pipeline, args=(repo_full_name, str(pr_number), server_dep_hops, server_lines_limit)).start()
+        else:
+            print(f"[Webhook] Bad Request: Repository name or PR number missing.", flush=True)
+            self.send_response(400)
             self.end_headers()
 
-server_dep_hops, server_lines_limit = 1, 2  # Default to 1-hop for strict budget compliance
+server_dep_hops, server_lines_limit = 1, 1  # Default to 1-hop and 1-round limits
 
 def main():
     global server_dep_hops, server_lines_limit
@@ -280,7 +368,7 @@ def main():
     parser.add_argument("--build-index", action="store_true")
     parser.add_argument("--commit")
     parser.add_argument("--dep-hops", type=int, default=1)  # Default to 1-hop for free tier limitations
-    parser.add_argument("--max-context-calls", type=int, default=2)
+    parser.add_argument("--max-context-calls", type=int, default=1) # Max additional escalation rounds a subagent may request (default 1)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     
@@ -308,7 +396,7 @@ def main():
                 diff_text = f.read()
         except Exception:
             sys.exit(1)
-        llm_client.reset_telemetry_counters(args.max_context_calls)
+        llm_client.reset_telemetry_counters()
         parsed_files = parse_full_diff(diff_text)
         all_comments = []
         conventions = get_repo_conventions()
@@ -324,7 +412,10 @@ def main():
             chunks = chunk_file_diffs(filepath, lang, data)
             for chunk in chunks:
                 try:
-                    comments = orchestrate_chunk_review(chunk, conventions, symbol_index={})
+                    comments = orchestrate_chunk_review(
+                        chunk, conventions, symbol_index={}, db_path=".", cache=cache,
+                        max_escalation_rounds=args.max_context_calls
+                    )
                     all_comments.extend(validate_and_deduplicate_comments(comments, filepath, data))
                 except Exception:
                     pass
@@ -336,7 +427,7 @@ def main():
         print("=========================================================\n", flush=True)
         return
     if args.repo and args.pr:
-        run_review_pipeline(args.repo, args.pr, dep_hops=args.dep_hops, get_lines_limit=args.max_context_calls)
+        run_review_pipeline(args.repo, args.pr, dep_hops=args.dep_hops, max_escalation_rounds=args.max_context_calls)
     else:
         parser.print_help()
 

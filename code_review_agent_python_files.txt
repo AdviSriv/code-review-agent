@@ -1,1441 +1,69 @@
-===== /root/code-review-agent/app/prompt_builder.py =====
-from typing import List
-
-def build_subagent_system_instruction(role: str, role_focus: str = "", conventions_text: str = "", static_baseline: str = "") -> str:
-    """
-    Builds a prompt tailored strictly to the SubagentResponse Pydantic schema with calibrated severity guidelines.
-    """
-    instruction = f"""
-You are an expert software engineer and critical code reviewer.
-Role: {role} Auditor.
-
-{role_focus}
-
-Your domain priorities:
-- P0: Blocker (exploits, leaks, severe vulnerabilities, immediate system crashes, or major data corruption)
-- P1: Must-fix-before-merge (correctness flaws, test bugs, broken logical business requirements, or standard API contract violations)
-- P2: Suggestion (performance gaps, structural issues, dead code, or refactoring suggestions)
-- P3: Suggestion (style updates, minor readability enhancements, documentation spelling errors, or missing newlines)
-
-CRITICAL SEVERITY CALIBRATION RULES:
-1. Do NOT upgrade suggestions (naming, file formatting, minor code cleanups) to P0 or P1. Style and refactoring suggestions are strictly P2/P3.
-2. If a test is written correctly but you cannot see the underlying implementation in the diff, do NOT assume the test will fail. Evaluate the code objectively based on the context provided.
-3. Be highly concise. Do not use filler introductory phrases. State the issue and the concrete code recommendation immediately.
-
-NEGATIVE REVIEWS AND NO-FLATTERY CONSTRAINT:
-- NEVER write a review comment if the code under review is correct, safe, improved, or already optimal. 
-- Do NOT write comments to praise, flatter, or confirm that the code is written well. 
-- Your findings list MUST be completely empty `[]` if there are no actual bugs, regressions, performance gaps, or vulnerabilities.
-- If the changed code is a positive improvement, simply return an empty findings list `[]` with status "SUCCESS".
-
-You MUST structure your final response strictly as a single JSON object matching the SubagentResponse schema below.
-Do not write any markdown descriptions, explanations, or text outside the JSON block.
-
-Target JSON Schema:
-{{
-  "status": "string ('SUCCESS' if analysis is complete, or 'NEEDS_CONTEXT' if you must resolve a specific vague symbol or external file to complete your review safely)",
-  "findings": [
-    {{
-      "position": integer (the exact 1-based diff position index from the hunk where the issue is),
-      "severity": "string (P0, P1, P2, or P3)",
-      "comment": "string (constructive feedback explaining the issue and recommending a concrete fix)",
-      "confidence": float (your confidence score from 0.0 to 1.0 representing your certainty that this is a real, reportable issue),
-      "references_specific_identifier": boolean (true if your comment references a specific variable, function, or class name in the diff),
-      "escalated_symbol": "string (optional: the exact name of a class or function you need resolved if status is 'NEEDS_CONTEXT')"
-    }}
-  ]
-}}
-
-ESCALATION TOOL OPTION:
-You have access to a tool named `get_lines(file, start, end)`.
-If you require more surrounding file context to analyze security or correctness, call this tool. Use it only when critical context is missing.
-"""
-    if static_baseline:
-        instruction += f"\n{static_baseline}\n"
-        
-    if conventions_text:
-        instruction += f"\nCustom Repository Rules to enforce:\n{conventions_text}\n"
-        
-    return instruction
-
-def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[str]:
-    hunks = parsed_diff.get("hunks", [])
-    if not hunks:
-        return []
-        
-    lines_repr = []
-    lines_repr.append(f"File: {filepath}")
-    lines_repr.append(f"Language: {language}")
-    
-    for idx, hunk in enumerate(hunks):
-        lines_repr.append(f"\nHunk {idx+1}: {hunk['header']}")
-        for diff_pos, char, line_num, content in hunk['lines']:
-            if line_num is not None:
-                lines_repr.append(f"Line {line_num} (DiffPos {diff_pos}): {char} {content}")
-            else:
-                lines_repr.append(f"DiffPos {diff_pos}: {char} {content}")
-                
-    return ["\n".join(lines_repr)]
-===== /root/code-review-agent/app/gatekeeper.py =====
-import time
-import threading
-from app.config import get_config
-
-class RateGatekeeper:
-    def __init__(self):
-        self.call_history = []
-        self.daily_count = 0
-        self.last_day_timestamp = time.time()
-        # Shared lock to synchronize rate tracking across subagent worker threads
-        self._lock = threading.Lock()
-
-    def update_window(self):
-        now = time.time()
-        self.call_history = [call for call in self.call_history if now - call[0] < 60]
-        
-        if now - self.last_day_timestamp >= 86400:
-            self.daily_count = 0
-            self.last_day_timestamp = now
-
-    def can_consume(self, estimated_tokens: int) -> tuple:
-        with self._lock:  # Mutex protection
-            self.update_window()
-            config = get_config()
-            
-            max_rpm = config.get("MAX_RPM", 12)
-            max_tpm = config.get("MAX_TPM", 200000)
-            max_rpd = config.get("MAX_RPD", 400)
-            
-            if self.daily_count >= max_rpd:
-                return False, 3600.0
-                
-            current_rpm = len(self.call_history)
-            current_tpm = sum(call[1] for call in self.call_history)
-            
-            if current_rpm >= max_rpm or (current_tpm + estimated_tokens) >= max_tpm:
-                if self.call_history:
-                    oldest_timestamp = self.call_history[0][0]
-                    sleep_duration = max(0.1, 60.1 - (time.time() - oldest_timestamp))
-                    return False, sleep_duration
-                return False, 5.0
-                
-            return True, 0.0
-
-    def record_call(self, tokens_used: int):
-        with self._lock:  # Mutex protection
-            self.update_window()
-            self.call_history.append((time.time(), tokens_used))
-            self.daily_count += 1
-===== /root/code-review-agent/app/output_parser.py =====
-import json
-from typing import List
-from app.models import CodeReviewResponse, CodeComment
-
-# Map raw severities directly to P-level labels
-SEVERITY_LABELS = {
-    "P0": "Blocker (P0)",
-    "P1": "Must-fix-before-merge (P1)",
-    "P2": "Suggestion (P2)",
-    "P3": "Suggestion (P3)"
-}
-
-def parse_and_sort_comments(raw_text: str) -> List[CodeComment]:
-    try:
-        cleaned_text = raw_text.strip()
-        if cleaned_text.startswith("```json"):
-            cleaned_text = cleaned_text[7:]
-        if cleaned_text.startswith("```"):
-            cleaned_text = cleaned_text[3:]
-        if cleaned_text.endswith("```"):
-            cleaned_text = cleaned_text[:-3]
-            
-        cleaned_text = cleaned_text.strip()
-        data = json.loads(cleaned_text)
-        
-        if isinstance(data, dict) and "comments" in data:
-            raw_comments = data["comments"]
-        elif isinstance(data, list):
-            raw_comments = data
-        else:
-            raw_comments = []
-            
-        comments = []
-        for item in raw_comments:
-            try:
-                comment = CodeComment(**item)
-                comments.append(comment)
-            except Exception:
-                pass
-                
-        severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-        comments.sort(key=lambda c: severity_order.get(c.severity, 99))
-        return comments
-    except Exception as e:
-        raise ValueError(f"Parsing failed for raw text structure: {e}\nRaw output: {raw_text}")
-
-def format_terminal_output(comments: List[CodeComment]):
-    print("\n================== TERMINAL REVIEW RESULTS ==================")
-    for c in comments:
-        label = SEVERITY_LABELS.get(c.severity, "Suggestion")
-        ref_id = " (References Identifier)" if c.references_specific_identifier else ""
-        print(f"[{label}] ({c.role}) File: {c.file} | Diff Position: {c.position}{ref_id}")
-        print(f"Feedback: {c.comment}")
-        print("-" * 60)
-    print("=============================================================\n")
-
-def build_github_review_payload(comments: List[CodeComment]) -> List[dict]:
-    gh_comments = []
-    
-    # Sort review findings strictly by severity (P0 -> P3)
-    severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-    comments.sort(key=lambda c: severity_order.get(c.severity, 99))
-    
-    for c in comments:
-        label = SEVERITY_LABELS.get(c.severity, "Suggestion")
-        
-        # Format header based on whether the comment card is coalesced or single-agent
-        if c.role == "Multiple":
-            header = f"### ⚠️ [{label}] Coalesced Findings"
-        else:
-            header = f"### ⚠️ [{label}] ({c.role}) Finding"
-            
-        body = f"{header}\n\n{c.comment}"
-        gh_comments.append({
-            "path": c.file,
-            "position": c.position,
-            "body": body
-        })
-    return gh_comments
-===== /root/code-review-agent/app/repo_intelligence.py =====
-import os
-import json
-import argparse
-import sqlite3
-import subprocess
-from pathlib import Path
-
-INTEL_DIR = Path.home() / ".config" / "code_review_agent" / "repo_intel"
-
-def make_rel(path_str: str, base_dir: str) -> str:
-    """
-    Safely converts an absolute path string to a relative path string 
-    relative to base_dir, normalizing all slashes.
-    """
-    if not path_str:
-        return ""
-    try:
-        rel = os.path.relpath(path_str, base_dir)
-        return rel.replace("\\", "/")
-    except ValueError:
-        return path_str.replace("\\", "/")
-
-def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
-    """
-    Invokes code-review-graph (CRG) to index the repository using Tree-sitter, 
-    and translates CRG's SQLite database structure into the exact symbol_index 
-    and dependency_graph formats expected by the downstream review pipeline.
-    """
-    repo_path = Path(repo_dir).resolve()
-    repo_path_str = str(repo_path)
-    print(f"[RepoIntel] Building repository intelligence for Commit: {commit_sha} inside {repo_path}")
-    
-    # 1. Run code-review-graph build command to parse and build/update the database
-    try:
-        res = subprocess.run(["code-review-graph", "build"], cwd=repo_path_str, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"[RepoIntel] code-review-graph build failed (code {res.returncode}): {res.stderr.strip()}")
-            # Attempt update if the database has already been initialized
-            subprocess.run(["code-review-graph", "update"], cwd=repo_path_str, check=True)
-    except Exception as e:
-        print(f"[RepoIntel] Failed to execute code-review-graph CLI build: {e}")
-        return ""
-
-    db_path = repo_path / ".code-review-graph" / "graph.db"
-    if not db_path.exists():
-        print(f"[RepoIntel] Error: SQLite graph database not found at {db_path}")
-        return ""
-
-    symbol_index = {}
-    dependency_graph = {}
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        # 2. Extract nodes to build the symbol index (Classes, Functions, etc.)
-        cursor.execute("""
-            SELECT name, qualified_name, file_path, line_start, line_end, kind 
-            FROM nodes 
-            WHERE kind != 'File'
-        """)
-        nodes = cursor.fetchall()
-        for node in nodes:
-            line_range = [node["line_start"] or 1, node["line_end"] or 1]
-            rel_file = make_rel(node["file_path"], repo_path_str)
-            
-            # Reconstruct relative qualified name to keep key lookup collision-free
-            qual_name = node["qualified_name"]
-            if "::" in qual_name:
-                parts = qual_name.split("::", 1)
-                rel_part = make_rel(parts[0], repo_path_str)
-                qual_name = f"{rel_part}::{parts[1]}"
-            else:
-                qual_name = make_rel(qual_name, repo_path_str)
-                
-            symbol_meta = {
-                "file_path": rel_file,
-                "line_range": line_range,
-                "type": node["kind"].lower()
-            }
-            # Key strictly by relative qualified_name to prevent simple-name silent collisions
-            symbol_index[qual_name] = symbol_meta
-
-        # 3. Extract all files to seed the dependency graph
-        cursor.execute("SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL")
-        files = cursor.fetchall()
-        for f in files:
-            rel_f = make_rel(f["file_path"], repo_path_str)
-            dependency_graph[rel_f] = {
-                "imports": [],
-                "imported_by": []
-            }
-
-        # 4. Map qualified_name to file_path for edge lookup
-        node_to_file = {}
-        cursor.execute("SELECT qualified_name, file_path FROM nodes WHERE file_path IS NOT NULL")
-        for row in cursor.fetchall():
-            node_to_file[row["qualified_name"]] = row["file_path"]
-
-        # 5. Extract import relations using qualified names mapped back to relative file paths
-        cursor.execute("""
-            SELECT 
-                e.source_qualified,
-                e.target_qualified,
-                n_src.file_path AS src_file,
-                n_tgt.file_path AS tgt_file
-            FROM edges e
-            LEFT JOIN nodes n_src ON e.source_qualified = n_src.qualified_name
-            LEFT JOIN nodes n_tgt ON e.target_qualified = n_tgt.qualified_name
-            WHERE e.kind IN ('IMPORTS_FROM', 'DEPENDS_ON')
-        """)
-        edges = cursor.fetchall()
-        for edge in edges:
-            src_file_abs = edge["src_file"] or node_to_file.get(edge["source_qualified"])
-            tgt_file_abs = edge["tgt_file"] or node_to_file.get(edge["target_qualified"])
-
-            if src_file_abs and tgt_file_abs:
-                src_file = make_rel(src_file_abs, repo_path_str)
-                tgt_file = make_rel(tgt_file_abs, repo_path_str)
-                
-                if src_file != tgt_file:
-                    dependency_graph.setdefault(src_file, {"imports": [], "imported_by": []})
-                    dependency_graph.setdefault(tgt_file, {"imports": [], "imported_by": []})
-
-                    # Append relative file paths
-                    if tgt_file not in dependency_graph[src_file]["imports"]:
-                        dependency_graph[src_file]["imports"].append(tgt_file)
-                    if src_file not in dependency_graph[tgt_file]["imported_by"]:
-                        dependency_graph[tgt_file]["imported_by"].append(src_file)
-
-                    # Append dotted module patterns for backwards compatibility with legacy BFS
-                    if tgt_file.endswith(".py"):
-                        dot_tgt = tgt_file[:-3].replace("/", ".")
-                    else:
-                        dot_tgt = tgt_file.replace("/", ".")
-                        
-                    if src_file.endswith(".py"):
-                        dot_src = src_file[:-3].replace("/", ".")
-                    else:
-                        dot_src = src_file.replace("/", ".")
-
-                    if dot_tgt not in dependency_graph[src_file]["imports"]:
-                        dependency_graph[src_file]["imports"].append(dot_tgt)
-                    if dot_src not in dependency_graph[tgt_file]["imported_by"]:
-                        dependency_graph[tgt_file]["imported_by"].append(dot_src)
-
-        conn.close()
-    except Exception as e:
-        print(f"[RepoIntel] Failed to process database nodes and edges: {e}")
-        return ""
-
-    if not symbol_index and not dependency_graph:
-        print("[RepoIntel] Warning: Empty symbol index and dependency graph. Aborting cache write.")
-        return ""
-
-    # Ensure output cache directory is present
-    INTEL_DIR.mkdir(parents=True, exist_ok=True)
-    out_file = INTEL_DIR / f"{commit_sha}.json"
-    
-    payload = {
-        "commit_sha": commit_sha,
-        "symbol_index": symbol_index,
-        "dependency_graph": dependency_graph
-    }
-    
-    with open(out_file, "w") as f:
-        json.dump(payload, f, indent=4)
-        
-    print(f"Repo Intelligence generated successfully via CRG for Commit: {commit_sha}")
-    return str(out_file)
-
-def load_repo_intelligence(commit_sha: str) -> dict:
-    intel_file = INTEL_DIR / f"{commit_sha}.json"
-    if intel_file.exists():
-        try:
-            with open(intel_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"symbol_index": {}, "dependency_graph": {}}
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build repository-wide static indices.")
-    parser.add_argument("--repo-dir", default=".", help="Root of local workspace")
-    parser.add_argument("--commit", required=True, help="Target Commit SHA key")
-    args = parser.parse_args()
-    build_repo_intelligence(args.repo_dir, args.commit)
-===== /root/code-review-agent/app/llm_client.py =====
-import os
-import time
-import threading
-import requests
-from google import genai
-from google.genai import types
-from app.config import get_secret, is_debug_mode
-
-_context = {
-    "owner": "",
-    "repo": "",
-    "token": "",
-    "commit_sha": ""
-}
-
-_lock = threading.Lock()
-get_lines_counter = 0
-get_lines_limit = 2
-_gatekeeper_ref = None
-
-token_stats = {
-    "prompt_tokens": 0,
-    "candidates_tokens": 0,
-    "total_tokens": 0
-}
-
-def get_lines(file: str, start: int, end: int) -> str:
-    """
-    Escalation option to fetch full file content lines.
-    """
-    global get_lines_counter, get_lines_limit
-    
-    with _lock:
-        if get_lines_limit != -1 and get_lines_counter >= get_lines_limit:
-            if is_debug_mode():
-                print(f"[DEBUG] [get_lines Tool] LLM requested get_lines('{file}', {start}, {end}) but limit is reached.")
-            return f"Error: Call limit exceeded (maximum {get_lines_limit} invocations of get_lines allowed)."
-        get_lines_counter += 1
-        
-    if is_debug_mode():
-        print(f"[DEBUG] [get_lines Tool] LLM invoked get_lines(file='{file}', start={start}, end={end}) [Call #{get_lines_counter}]")
-
-    content = ""
-    
-    workspace = _context.get("workspace")
-    target_path = os.path.join(workspace, file) if workspace else file
-    
-    if os.path.exists(target_path):
-        try:
-            with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            start_idx = max(0, start - 1)
-            end_idx = min(len(lines), end)
-            content = "".join(lines[start_idx:end_idx])
-        except Exception:
-            pass
-            
-    if not content:
-        owner = _context.get("owner")
-        repo = _context.get("repo")
-        token = _context.get("token")
-        ref = _context.get("commit_sha")
-        
-        if owner and repo and token and ref:
-            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file}"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github.v3.raw"
-            }
-            params = {"ref": ref}
-            try:
-                response = requests.get(url, headers=headers, params=params)
-                if response.status_code == 200:
-                    lines = response.text.splitlines(keepends=True)
-                    start_idx = max(0, start - 1)
-                    end_idx = min(len(lines), end)
-                    content = "".join(lines[start_idx:end_idx])
-            except Exception:
-                pass
-                
-    if not content:
-        return f"Error: File '{file}' not found locally or remote parameters missing."
-
-    content_tokens = int(len(content) / 4)
-    if _gatekeeper_ref:
-        while True:
-            can_go, wait_time = _gatekeeper_ref.can_consume(content_tokens)
-            if can_go:
-                _gatekeeper_ref.record_call(content_tokens)
-                break
-            if is_debug_mode():
-                print(f"[DEBUG] [get_lines Tool] Quota threshold near. Delaying tool content return. Pausing thread for {wait_time:.1f}s...")
-            time.sleep(wait_time)
-            
-    return content
-
-def reset_telemetry_counters(limit: int = 2):
-    global get_lines_counter, get_lines_limit
-    with _lock:
-        get_lines_counter = 0
-        get_lines_limit = limit
-        token_stats["prompt_tokens"] = 0
-        token_stats["candidates_tokens"] = 0
-        token_stats["total_tokens"] = 0
-
-def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
-    api_key = get_secret("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not defined. Run `python -m app.config --set-gemini` to configure it.")
-        
-    client = genai.Client(api_key=api_key)
-    model_name = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
-    
-    config_kwargs = {
-        "temperature": 0.1,
-        "system_instruction": system_instruction,
-    }
-    
-    if response_schema is not None:
-        config_kwargs["response_mime_type"] = "application/json"
-        config_kwargs["response_schema"] = response_schema
-    else:
-        config_kwargs["tools"] = [get_lines]
-        
-    config = types.GenerateContentConfig(**config_kwargs)
-    
-    max_retries = 3
-    retry_delay = 5
-    
-    if is_debug_mode():
-        print(f"[DEBUG] [LLM Client] Sending generation call to model '{model_name}' (Payload size: {len(prompt)} chars).")
-        
-    response = None
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            break
-        except Exception as e:
-            error_str = str(e)
-            is_transient = (
-                "503" in error_str or 
-                "429" in error_str or 
-                "UNAVAILABLE" in error_str or 
-                "RESOURCE_EXHAUSTED" in error_str or
-                "quota" in error_str.lower()
-            )
-            
-            if is_transient and attempt < max_retries - 1:
-                print(f"[LLM Client] Quota/Transient error on attempt {attempt+1}. Retrying in {retry_delay} seconds... Error: {error_str.splitlines()[0]}")
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                raise e
-    
-    if not response or not response.text:
-        raise RuntimeError("LLM returned an empty response.")
-        
-    usage = response.usage_metadata
-    if usage:
-        with _lock:
-            token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
-            token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
-            token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
-            if is_debug_mode():
-                print(f"[DEBUG] [LLM Client] Call finished. Tokens used in turn: {getattr(usage, 'total_token_count', 0)}")
-        
-    return response.text
-===== /root/code-review-agent/app/triage.py =====
-import os
-import sys
-import subprocess
-from app.config import get_config
-from app.diff_parser import is_ignored_file
-
-def evaluate_docs_only_skip(changed_files: list) -> bool:
-    if not changed_files:
-        return True
-        
-    config = get_config()
-    skip_extensions = config.get("TRIAGE_SKIP_PATTERNS", [])
-    
-    for f in changed_files:
-        if is_ignored_file(f):
-            continue
-        ext = os.path.splitext(f)[1].lower()
-        if ext not in skip_extensions:
-            return False
-            
-    return True
-
-# Comprehensive compiler and static logic checks
-COMPILER_REGISTRY = {
-    ".py": {
-        "lang": "Python",
-        "cmd": lambda files: [sys.executable or "python3", "-m", "py_compile"] + files,
-        # Secondary static rules to execute if available on the VM
-        "linters": [
-            {"exec": "ruff", "args": lambda files: ["ruff", "check", "--no-fix"] + files},
-            {"exec": "mypy", "args": lambda files: ["mypy", "--ignore-missing-imports"] + files}
-        ]
-    },
-    ".js": {
-        "lang": "JavaScript",
-        "cmd": lambda files: ["node", "--check"] + files,
-        "linters": [
-            {"exec": "eslint", "args": lambda files: ["npx", "eslint"] + files}
-        ]
-    },
-    ".ts": {
-        "lang": "TypeScript",
-        "cmd": lambda files: ["tsc", "--noEmit"] + files
-    },
-    ".go": {
-        "lang": "Go",
-        "cmd": lambda files: ["go", "vet", "./..."]
-    },
-    ".rs": {
-        "lang": "Rust",
-        "cmd": lambda files: ["cargo", "check"]
-    }
-}
-
-def is_executable_available(name: str) -> bool:
-    try:
-        subprocess.run(["which", name], capture_output=True, check=True)
-        return True
-    except Exception:
-        return False
-
-def run_native_compile_check(changed_files: list) -> dict:
-    """
-    Runs compiler/syntax passes, followed by local lint/static checkers if available.
-    """
-    errors = []
-    failed_languages = set()
-    
-    grouped_files = {}
-    for f in changed_files:
-        if not os.path.exists(f):
-            continue
-        ext = os.path.splitext(f)[1].lower()
-        if ext in COMPILER_REGISTRY:
-            grouped_files.setdefault(ext, []).append(f)
-            
-    for ext, files in grouped_files.items():
-        rule = COMPILER_REGISTRY[ext]
-        lang_name = rule["lang"]
-        cmd_generator = rule["cmd"]
-        
-        # 1. Run mandatory base compilation checks
-        cmd = cmd_generator(files)
-        executable = cmd[0]
-        
-        if not is_executable_available(executable):
-            print(f"[Triage] Compiler '{executable}' not found on VM. Skipping check.")
-            continue
-            
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            err = res.stderr.strip() or res.stdout.strip()
-            errors.append(f"[{lang_name} Syntax Error]\n{err}")
-            failed_languages.add(lang_name)
-            continue  # Re-raise compile errors immediately
-            
-        # 2. Run runtime static assertions (e.g. Ruff/Mypy/Eslint) if present
-        for linter in rule.get("linters", []):
-            lexec = linter["exec"]
-            if is_executable_available(lexec):
-                lcmd = linter["args"](files)
-                lres = subprocess.run(lcmd, capture_output=True, text=True)
-                if lres.returncode != 0:
-                    lerr = lres.stderr.strip() or lres.stdout.strip()
-                    errors.append(f"[{lang_name} {lexec.capitalize()} Logic/Type Error]\n{lerr}")
-                    failed_languages.add(lang_name)
-
-    if errors:
-        langs_str = " & ".join(sorted(failed_languages))
-        header = f"### ❌ Local Triage Verification Failed\nStatic validation failed on changed **{langs_str}** files. Build-level issues must be resolved before triggering AI code reviews."
-        body = "\n\n".join(errors[:10])
-        if len(errors) > 10:
-            body += f"\n\n*+ {len(errors) - 10} more errors output truncated*"
-            
-        full_message = f"{header}\n\n```text\n{body[:1800]}\n```"
-        return {"passed": False, "error_msg": full_message}
-
-    return {"passed": True, "error_msg": ""}
-===== /root/code-review-agent/app/repo_checks.py =====
-import os
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/validator.py =====
 import re
-import requests
-from typing import List
-
-def read_local_file(filename: str) -> str:
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception:
-            pass
-    return ""
-
-def fetch_github_file(owner: str, repo: str, filename: str, token: str) -> str:
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filename}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3.raw"
-    }
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.text
-    except Exception:
-        pass
-    return ""
-
-def get_repo_conventions(owner: str = None, repo: str = None, token: str = None) -> str:
-    for name in ["AGENTS.md", "CLAUDE.md"]:
-        content = read_local_file(name)
-        if content:
-            return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
-            
-    if owner and repo and token:
-        for name in ["AGENTS.md", "CLAUDE.md"]:
-            content = fetch_github_file(owner, repo, name, token)
-            if content:
-                return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
-    return ""
-
-def validate_commit_format(commit_message: str) -> bool:
-    if not commit_message:
-        return False
-    first_line = commit_message.splitlines()[0].strip()
-    pattern = r"^(feat|fix|chore|docs|refactor|style|test|ci)(\(.+\))?:\s+.{3,}"
-    return bool(re.match(pattern, first_line, re.IGNORECASE))
-
-def fetch_and_validate_commits(owner: str, repo: str, pr_number: str, token: str) -> List[str]:
-    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
-    suggestions = []
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            commits = response.json()
-            for c in commits:
-                msg = c.get("commit", {}).get("message", "")
-                sha = c.get("sha", "")[:7]
-                if not validate_commit_format(msg):
-                    suggestions.append(
-                        f"Commit `{sha}` ('{msg.splitlines()[0]}') is non-compliant. Format requires `<type>: <desc>` (what and why)."
-                    )
-    except Exception as e:
-        print(f"Warning: Commit checking errored: {e}")
-    return suggestions
-===== /root/code-review-agent/app/chunker.py =====
-import os
-import requests
-from app.config import get_config, is_debug_mode
-
-def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
-    """
-    Fetches the content or signature of a symbol. Falls back to GitHub if the VM has no local checkout.
-    """
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            start = max(0, line_range[0] - 1)
-            end = min(len(lines), line_range[1])
-            symbol_lines = lines[start:end]
-            
-            if fallback_only:
-                return symbol_lines[0].strip() if symbol_lines else ""
-            return "".join(symbol_lines)
-        except Exception:
-            pass
-            
-    from app.llm_client import _context
-    owner = _context.get("owner")
-    repo = _context.get("repo")
-    token = _context.get("token")
-    ref = _context.get("commit_sha")
-    
-    if owner and repo and token and ref:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3.raw"
-        }
-        params = {"ref": ref}
-        try:
-            response = requests.get(url, headers=headers, params=params)
-            if response.status_code == 200:
-                lines = response.text.splitlines(keepends=True)
-                start = max(0, line_range[0] - 1)
-                end = min(len(lines), line_range[1])
-                symbol_lines = lines[start:end]
-                
-                if fallback_only:
-                    return symbol_lines[0].strip() if symbol_lines else ""
-                return "".join(symbol_lines)
-        except Exception as e:
-            return f"# Remote fallback error loading {filepath}: {e}"
-            
-    return f"# File '{filepath}' not found locally or remote parameters missing."
-
-def get_recursive_dependencies(filepath: str, dependency_graph: dict, max_hops: int = 2) -> set:
-    """
-    Traverses dependency trees recursively. This version prioritizes the pre-loaded 
-    in-memory dependency_graph for microsecond-level, O(1) in-memory lookups. 
-    It falls back to CRG's SQLite database only if the in-memory graph is unavailable.
-    """
-    resolved_files = set()
-    
-    if is_debug_mode():
-        print(f"[DEBUG] [Chunker] Resolving dependencies recursively (Max Hops: {max_hops})")
-        
-    # 1. PRIMARY PATH: Lightning-fast, cycle-proof in-memory BFS
-    if dependency_graph:
-        queue = [(filepath, 0)]
-        visited = {filepath}
-        
-        while queue:
-            curr_file, hop = queue.pop(0)
-            
-            if max_hops != -1 and hop >= max_hops:
-                continue
-                
-            imports = dependency_graph.get(curr_file, {}).get("imports", [])
-            for imp in imports:
-                # Cleanly normalize both relative file paths and dotted module paths
-                if "." in imp or not imp.endswith(".py"):
-                    imp_file = imp.replace(".", "/") + ".py"
-                else:
-                    imp_file = imp
-                    
-                if imp_file in dependency_graph and imp_file not in visited:
-                    visited.add(imp_file)
-                    if imp_file != filepath:
-                        resolved_files.add(imp_file)
-                    queue.append((imp_file, hop + 1))
-        
-        if is_debug_mode():
-            print(f"[DEBUG] [Chunker]   - In-memory Transitive dependencies found: {resolved_files}")
-        return resolved_files
-
-    # 2. FALLBACK PATH: SQLite Database query (only if in-memory graph is missing)
-    from app.llm_client import _context
-    workspace = _context.get("workspace") or "."
-    workspace_abs = os.path.abspath(workspace)
-    db_path = os.path.join(workspace_abs, ".code-review-graph", "graph.db")
-    
-    if os.path.exists(db_path):
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            filepath_abs = os.path.abspath(os.path.join(workspace_abs, filepath)).replace("\\", "/")
-            
-            if is_debug_mode():
-                print(f"[DEBUG] [Chunker] Falling back to SQLite. Normalized search path: '{filepath_abs}'")
-
-            queue = [(filepath_abs, 0)]
-            visited = {filepath_abs}
-            
-            while queue:
-                curr_target, hop = queue.pop(0)
-                
-                if max_hops != -1 and hop >= max_hops:
-                    continue
-                
-                cursor.execute("""
-                    SELECT DISTINCT e.target_qualified, n.file_path 
-                    FROM edges e
-                    JOIN nodes n ON n.qualified_name = e.target_qualified
-                    WHERE (e.source_qualified = ? OR e.file_path = ?) 
-                      AND e.kind = 'IMPORTS_FROM'
-                      AND n.kind = 'File'
-                    
-                    UNION
-                    
-                    SELECT DISTINCT e.target_qualified, n.file_path 
-                    FROM edges e
-                    JOIN nodes n ON n.file_path = e.target_qualified
-                    WHERE (e.source_qualified = ? OR e.file_path = ?) 
-                      AND e.kind = 'IMPORTS_FROM'
-                      AND n.kind = 'File'
-                """, (curr_target, curr_target, curr_target, curr_target))
-                
-                rows = cursor.fetchall()
-                for row in rows:
-                    target_qual, target_file = row
-                    
-                    if target_qual and target_qual not in visited:
-                        visited.add(target_qual)
-                        queue.append((target_qual, hop + 1))
-                        
-                    if target_file and target_file not in visited:
-                        visited.add(target_file)
-                        queue.append((target_file, hop + 1))
-                        
-                    if target_file and target_file != filepath_abs:
-                        row_rel = os.path.relpath(target_file, workspace_abs).replace("\\", "/")
-                        resolved_files.add(row_rel)
-                
-            conn.close()
-            
-            if is_debug_mode():
-                print(f"[DEBUG] [Chunker]   - SQLite Transitive dependencies found: {resolved_files}")
-            return resolved_files
-        except Exception as e:
-            if is_debug_mode():
-                print(f"[DEBUG] [Chunker]   - SQLite fallback traversal failed. Error: {e}")
-                
-    return resolved_files
-    
-def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict, max_hops: int = 2) -> str:
-    """
-    Aggregates transitive definitions up to N hops, embedding explicit line-range parameters
-    into metadata headers to prevent the LLM from guessing tool arguments.
-    """
-    config = get_config()
-    token_budget = config.get("DEP_TOKEN_BUDGET", 8000)
-    
-    bundle_lines = ["\n--- TRANSITIVE MODULE CONTEXT LOG ---"]
-    transitive_deps = get_recursive_dependencies(filepath, dependency_graph, max_hops=max_hops)
-    
-    accumulated_chars = sum(len(x) for x in bundle_lines)
-    fallback_mode = False
-    
-    for dep_file in transitive_deps:
-        matching_symbols = [name for name, info in symbol_index.items() if info["file_path"] == dep_file]
-        
-        for sym_name in matching_symbols:
-            meta = symbol_index[sym_name]
-            line_range = meta.get("line_range", [1, 20])
-            
-            content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=fallback_mode)
-            
-            # Reconstruct payload headers with explicit start and end line bounds
-            if (accumulated_chars + len(content)) / 4 > token_budget:
-                fallback_mode = True
-                content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=True)
-                payload = f"\nDependency definition Signature for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
-            else:
-                payload = f"\nDependency definition for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
-                
-            bundle_lines.append(payload)
-            accumulated_chars += len(payload)
-            
-    if is_debug_mode():
-        print(f"[DEBUG] [Chunker] Dependency context compilation complete. Active size: {accumulated_chars} characters (~{int(accumulated_chars/4)} tokens).")
-        
-    if len(bundle_lines) <= 1:
-        return ""
-        
-    return "\n".join(bundle_lines)
-===== /root/code-review-agent/app/main.py =====
-import os
-import sys
-import argparse
-import requests
-import json
-import threading
-import time
-import subprocess
-import shutil
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# Config and parsers
-from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode
-from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
-from app.prompt_builder import chunk_file_diffs
-import app.llm_client as llm_client
 from app.models import CodeComment
-from app.output_parser import build_github_review_payload
-from app.repo_checks import get_repo_conventions, fetch_and_validate_commits
 
-# Import Phase 2 Modules
-from app.repo_intelligence import load_repo_intelligence, build_repo_intelligence
-from app.triage import evaluate_docs_only_skip, run_native_compile_check
-from app.chunker import compile_dependency_bundle
-from app.gatekeeper import RateGatekeeper
-from app.orchestrator import orchestrate_chunk_review
-from app.validator import validate_and_deduplicate_comments
+# Mapping validation metrics
+SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+REPORT_THRESHOLD = SEVERITY_RANK["P2"]
+CONFIDENCE_THRESHOLD = 0.6
 
-gatekeeper = RateGatekeeper()
+def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
+    all_text = " ".join(
+        list(parsed_diff_file.get("added_lines", {}).values()) + 
+        list(parsed_diff_file.get("context_lines", {}).values())
+    )
+    candidates = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", comment)
+    if not candidates:
+        return True
+    return any(c in all_text for c in candidates)
 
-def fetch_repo_metadata(owner: str, repo: str, token: str) -> dict:
-    url = f"https://api.github.com/repos/{owner}/{repo}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return {}
+def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_diff_file: dict) -> list:
+    valid_comments = []
+    valid_positions = parsed_diff_file.get("valid_positions", set())
+    
+    for f in findings:
+        f.file = file_path
+        if f.position not in valid_positions:
+            print(f"[Validator] Rejected hallucinated position {f.position} on {file_path}")
+            continue
+            
+        if f.confidence < CONFIDENCE_THRESHOLD:
+            continue
+            
+        if f.references_specific_identifier:
+            if not is_identifier_grounded(f.comment, parsed_diff_file):
+                old_sev = f.severity
+                f.severity = {"P0": "P1", "P1": "P2", "P2": "P3", "P3": "P3"}.get(f.severity, "P3")
+                print(f"[Validator] Ungrounded symbol reference at position {f.position}. Demoted {old_sev} -> {f.severity}.")
+        if SEVERITY_RANK.get(f.severity, 99) > REPORT_THRESHOLD:
+            continue
+        valid_comments.append(f)
 
-def fetch_pr_metadata(owner: str, repo: str, pr_number: str, token: str) -> dict:
-    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise RuntimeError(f"Failed to fetch PR metadata. API Status: {response.status_code}")
-    return response.json()
-
-def fetch_all_pr_files(owner: str, repo: str, pr_number: str, token: str) -> list:
-    all_files = []
-    page = 1
-    while True:
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
-        params = {"page": page, "per_page": 100}
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json"
-        }
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to fetch PR files. API Status: {response.status_code}")
+    grouped_by_pos = {}
+    for c in valid_comments:
+        grouped_by_pos.setdefault(c.position, []).append(c)
         
-        data = response.json()
-        if not data:
-            break
-        all_files.extend(data)
-        if len(data) < 100:
-            break
-        page += 1
-    return all_files
-
-def post_github_review(owner: str, repo: str, pr_number: str, token: str, commit_id: str, comments: list, body_summary: str):
-    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "Content-Type": "application/json"
-    }
-    
-    MAX_COMMENTS_PER_BATCH = 8
-    
-    if not comments:
-        payload = {
-            "commit_id": commit_id,
-            "event": "COMMENT",
-            "body": body_summary,
-            "comments": []
-        }
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code not in [200, 201]:
-            print(f"Failed to post review. Status: {response.status_code}, Info: {response.text}")
+    deduped = []
+    for pos, group in grouped_by_pos.items():
+        if len(group) == 1:
+            deduped.append(group[0])
         else:
-            print("Summary review posted successfully.")
-        return
-
-    comment_batches = [comments[i:i + MAX_COMMENTS_PER_BATCH] for i in range(0, len(comments), MAX_COMMENTS_PER_BATCH)]
-    print(f"[Publisher] Splitting review into {len(comment_batches)} paced batches of max {MAX_COMMENTS_PER_BATCH} inline comments to satisfy API rate limits.")
-    
-    for idx, batch in enumerate(comment_batches, 1):
-        batch_body = body_summary if idx == 1 else f"### 🛡️ Phase 2 Inline Code Review [Batch {idx}/{len(comment_batches)}]"
-        
-        payload = {
-            "commit_id": commit_id,
-            "event": "COMMENT",
-            "body": batch_body,
-            "comments": batch
-        }
-        
-        response = requests.post(url, headers=headers, json=payload)
-        
-        if response.status_code not in [200, 201]:
-            print(f"[Publisher] Failed to post batch {idx}. Status: {response.status_code}, Info: {response.text}")
-            if response.status_code in [403, 429]:
-                print("[Publisher] Hit secondary rate limits mid-write. Sleeping for 10s before retry...")
-                time.sleep(10.0)
-                response = requests.post(url, headers=headers, json=payload)
-                if response.status_code not in [200, 201]:
-                    print(f"[Publisher] Retry failed for batch {idx}. Skipping this batch.")
-        else:
-            print(f"[Publisher] Inline Comment Batch {idx}/{len(comment_batches)} submitted successfully.")
-        
-        if idx < len(comment_batches):
-            time.sleep(2.0)
-
-def ensure_local_checkout(owner: str, repo_name: str, commit_sha: str, token: str) -> str:
-    cache_dir = Path.home() / ".cache" / "code_review_agent" / "repos" / owner / repo_name
-    workspace_path = str(cache_dir)
-    
-    if cache_dir.exists() and not (cache_dir / ".git").exists():
-        print(f"[Workspace] Cleaning up invalid/empty clone directory: {workspace_path}")
-        try:
-            shutil.rmtree(cache_dir)
-        except Exception as e:
-            print(f"[Workspace] Failed to clean directory: {e}")
-            
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    if not (cache_dir / ".git").exists():
-        print(f"[Workspace] Cloning repository '{owner}/{repo_name}' dynamically...")
-        clone_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
-        res = subprocess.run(["git", "clone", clone_url, workspace_path], capture_output=True, text=True)
-        
-        if res.returncode != 0:
-            print(f"[Workspace] Authenticated clone failed: {res.stderr.strip()}")
-            print("[Workspace] Attempting fallback clone as a public repository (no token)...")
-            
-            try:
-                shutil.rmtree(cache_dir)
-            except Exception:
-                pass
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            public_url = f"https://github.com/{owner}/{repo_name}.git"
-            res = subprocess.run(["git", "clone", public_url, workspace_path], capture_output=True, text=True)
-            
-            if res.returncode != 0:
-                try:
-                    shutil.rmtree(cache_dir)
-                except Exception:
-                    pass
-                raise RuntimeError(f"Clone failed under both authenticated and public scopes: {res.stderr.strip()}")
-    else:
-        subprocess.run(["git", "reset", "--hard"], cwd=workspace_path, capture_output=True)
-        subprocess.run(["git", "clean", "-fd"], cwd=workspace_path, capture_output=True)
-        res = subprocess.run(["git", "fetch", "origin"], cwd=workspace_path, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"[Workspace] Fetch failed: {res.stderr.strip()}")
-            
-    print(f"[Workspace] Checking out commit '{commit_sha}'...")
-    res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
-    if res.returncode != 0:
-        subprocess.run(["git", "fetch", "--unshallow"], cwd=workspace_path, capture_output=True)
-        res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"Checkout failed completely: {res.stderr.strip()}")
-            
-    return workspace_path
-
-# Insert/Replace these functions inside app/main.py
-
-def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 2, get_lines_limit: int = 2):
-    print(f"\n[Pipeline] Initializing Review for {repo_full_name} PR #{pr_number}")
-    start_time = time.time()  # Track pipeline latency
-    try:
-        token = get_repo_pat(repo_full_name)
-        if not token:
-            print(f"[Pipeline] Error: GITHUB_PAT not configured for '{repo_full_name}'.")
-            return
-            
-        owner, repo = repo_full_name.split("/")
-        
-        repo_meta = fetch_repo_metadata(owner, repo, token)
-        repo_size_kb = repo_meta.get("size", 0)
-        
-        pr_data = fetch_pr_metadata(owner, repo, pr_number, token)
-        if pr_data.get("draft") is True:
-            print(f"[Pipeline] PR #{pr_number} is a draft. Skipped.")
-            return
-            
-        commit_id = pr_data.get("head", {}).get("sha")
-        base_sha = pr_data.get("base", {}).get("sha")
-        
-        workspace_path = ensure_local_checkout(owner, repo, commit_id, token)
-        
-        llm_client._context["owner"] = owner
-        llm_client._context["repo"] = repo
-        llm_client._context["token"] = token
-        llm_client._context["commit_sha"] = commit_id
-        llm_client._context["workspace"] = workspace_path
-        llm_client._gatekeeper_ref = gatekeeper
-        
-        intel_data = load_repo_intelligence(base_sha)
-        
-        if not intel_data.get("symbol_index") or not intel_data.get("dependency_graph"):
-            print(f"[RepoIntel] Index for base commit '{base_sha}' is missing or empty. Forcing checkout and rebuild...")
-            
-            intel_file = Path.home() / ".config" / "code_review_agent" / "repo_intel" / f"{base_sha}.json"
-            if intel_file.exists():
-                try:
-                    os.remove(intel_file)
-                except Exception:
-                    pass
-            
-            ensure_local_checkout(owner, repo, base_sha, token)
-            build_repo_intelligence(workspace_path, base_sha)
-            
-            ensure_local_checkout(owner, repo, commit_id, token)
-            intel_data = load_repo_intelligence(base_sha)
-            
-        symbol_index = intel_data.get("symbol_index", {})
-        dependency_graph = intel_data.get("dependency_graph", {})
-        
-        pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
-        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
-        
-        if evaluate_docs_only_skip(changed_file_paths):
-            print("[Pipeline] Triage: Skipped. Docs-only changes detected.")
-            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains documentation, configurations, or lockfiles only.")
-            return
-            
-        os.chdir(workspace_path)
-        compile_status = run_native_compile_check(changed_file_paths)
-        if not compile_status["passed"]:
-            print("[Pipeline] Triage: Skipped due to compilation syntax/linter errors.")
-            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
-            return
-            
-        all_comments = []
-        total_diff_lines = 0
-        conventions = get_repo_conventions(owner, repo, token)
-        
-        for f in pr_files:
-            filename = f.get("filename")
-            patch = f.get("patch")
-            
-            if is_ignored_file(filename) or not patch:
-                continue
-                
-            total_diff_lines += len(patch.splitlines())
-            lang = identify_language(filename)
-            parsed_diff = parse_patch(patch)
-            
-            chunks = chunk_file_diffs(filename, lang, parsed_diff)
-            
-            for chunk in chunks:
-                dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
-                payload = f"{chunk}\n\n{dep_bundle}"
-                
-                estimated_tokens = int(len(payload) / 4)
-                
-                if is_debug_mode():
-                    print(f"\n[DEBUG] [Pipeline] Chunk Payload size: {len(payload)} chars (~{estimated_tokens} tokens).")
-                    print(f"[DEBUG] [Pipeline] Chunk Payload Header:\n{payload[:300]}\n...")
-                
-                while True:
-                    can_go, wait_time = gatekeeper.can_consume(estimated_tokens)
-                    if can_go:
-                        break
-                    print(f"[Gatekeeper] Quota limits approaching. Throttling review thread, waiting {wait_time:.1f}s...")
-                    time.sleep(wait_time)
-                
-                llm_client.reset_telemetry_counters(get_lines_limit)
-                
-                print(f"[Pipeline] Analysing file chunks: '{filename}'...")
-                chunk_comments = orchestrate_chunk_review(payload, conventions, symbol_index)
-                
-                gatekeeper.record_call(estimated_tokens)
-                
-                validated_comments = validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
-                all_comments.extend(validated_comments)
-
-        commit_suggestions = fetch_and_validate_commits(owner, repo, pr_number, token)
-        gh_comments = build_github_review_payload(all_comments)
-        
-        summary_body = f"### 🛡️ Phase 2 Code Review Complete\n\nAll findings have been batched and mapped directly to lines."
-        if commit_suggestions:
-            summary_body += "\n\n### ⚠️ Commit Message Conventions Suggestions\n"
-            for s in commit_suggestions:
-                summary_body += f"- {s}\n"
-                
-        if gh_comments or commit_suggestions:
-            post_github_review(owner, repo, pr_number, token, commit_id, gh_comments, summary_body)
-        else:
-            print("[Pipeline] No findings. Skipping empty review posting.")
-            
-        elapsed_time = time.time() - start_time
-        print("\n================== PERFORMANCE METRICS ==================")
-        if repo_size_kb:
-            print(f"Repository size: {repo_size_kb:,} KB")
-        else:
-            print("Repository size: Unknown/Unavailable")
-        print(f"PR Diff size: {total_diff_lines:,} total lines processed")
-        print(f"Execution Latency: {elapsed_time:.2f} seconds")  # Display latency
-        print(f"Tokens consumed for evaluation:")
-        print(f"  - Input (Prompt) Tokens: {llm_client.token_stats['prompt_tokens']:,}")
-        print(f"  - Output (Completion) Tokens: {llm_client.token_stats['candidates_tokens']:,}")
-        print(f"  - Total Tokens consumed: {llm_client.token_stats['total_tokens']:,}")
-        print("=========================================================\n")
-            
-    except Exception as e:
-        print(f"[Pipeline] Crash: {e}")
-
-
-class WebhookHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path != "/webhook":
-            self.send_response(404)
-            self.end_headers()
-            return
-            
-        content_length = int(self.headers.get('Content-Length', 0) or 0)
-        post_data = self.rfile.read(content_length)
-        
-        try:
-            event = self.headers.get('X-GitHub-Event', '')
-            if event != 'pull_request':
-                self.send_response(200)
-                self.end_headers()
-                return
-                
-            payload = json.loads(post_data.decode('utf-8'))
-            action = payload.get("action")
-            
-            if action not in ["opened", "synchronize", "ready_for_review"]:
-                self.send_response(200)
-                self.end_headers()
-                return
-                
-            pr_data = payload.get("pull_request", {})
-            if pr_data.get("draft") is True:
-                self.send_response(200)
-                self.end_headers()
-                return
-                
-            repo_full_name = payload.get("repository", {}).get("full_name")
-            pr_number = payload.get("number")
-            
-            if repo_full_name and pr_number:
-                self.send_response(202)
-                self.end_headers()
-                
-                thread = threading.Thread(
-                    target=run_review_pipeline,
-                    args=(repo_full_name, str(pr_number), server_dep_hops, server_lines_limit)
-                )
-                thread.start()
-            else:
-                self.send_response(400)
-                self.end_headers()
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            print(f"Error handling webhook: {e}")
-
-server_dep_hops = 2
-server_lines_limit = 2
-
-def main():
-    global server_dep_hops, server_lines_limit
-    
-    parser = argparse.ArgumentParser(description="Phase 2 Code Review Agent")
-    parser.add_argument("--repo", help="Target repository 'owner/repo'")
-    parser.add_argument("--pr", help="Pull request ID number")
-    parser.add_argument("--diff-file", help="Path to local diff file")
-    parser.add_argument("--server", action="store_true", help="Start background Webhook Server")
-    parser.add_argument("--port", type=int, default=8000, help="Webhook server port")
-    parser.add_argument("--build-index", action="store_true", help="Manually trigger Module A indexing on local workspace")
-    parser.add_argument("--commit", help="Commit SHA key (required for --build-index)")
-    
-    parser.add_argument("--dep-hops", type=int, default=2, help="Dependency graph BFS depth. Set to -1 to crawl all connected nodes.")
-    parser.add_argument("--max-context-calls", type=int, default=2, help="Max context escalations (get_lines) allowed per run. Set to -1 for unlimited.")
-    parser.add_argument("--debug", action="store_true", help="Enable detailed trace logging throughout the execution flow.")
-    args = parser.parse_args()
-    
-    if args.build_index:
-        if not args.commit:
-            print("Error: --commit <SHA> is required when building index.")
-            sys.exit(1)
-        build_repo_intelligence(".", args.commit)
-        return
-
-    server_dep_hops = args.dep_hops
-    server_lines_limit = args.max_context_calls
-    
-    if args.debug:
-        set_debug_mode(True)
-
-    if args.server:
-        server = HTTPServer(('0.0.0.0', args.port), WebhookHandler)
-        # Add flush=True to make sure output is displayed immediately
-        print(f"Webhook Receiver active on port {args.port} (Hops: {server_dep_hops}, Context Calls: {server_lines_limit})...", flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("Server shutting down.", flush=True)
-        return
-
-    if args.diff_file:
-        print(f"Reading local diff file: {args.diff_file}...")
-        start_time = time.time()  # Track latency in offline mode
-        try:
-            with open(args.diff_file, "r") as f:
-                diff_text = f.read()
-        except Exception as e:
-            print(f"Failed to read file: {e}")
-            sys.exit(1)
-            
-        llm_client.reset_telemetry_counters(args.max_context_calls)
-        parsed_files = parse_full_diff(diff_text)
-        all_comments = []
-        conventions = get_repo_conventions()
-        
-        total_diff_lines = len(diff_text.splitlines())
-        
-        for filepath, data in parsed_files.items():
-            if is_ignored_file(filepath):
-                continue
-            lang = identify_language(filepath)
-            chunks = chunk_file_diffs(filepath, lang, data)
-            
-            for chunk in chunks:
-                try:
-                    comments = orchestrate_chunk_review(chunk, conventions, symbol_index={})
-                    all_comments.extend(comments)
-                except Exception as e:
-                    print(f"Error reviewing chunk: {e}")
-                    
-        elapsed_time = time.time() - start_time
-        print("\n================== PERFORMANCE METRICS ==================")
-        print("Repository size: N/A (offline local execution mode)")
-        print(f"PR Diff size: {total_diff_lines:,} total lines processed")
-        print(f"Execution Latency: {elapsed_time:.2f} seconds")  # Display latency
-        print(f"Tokens consumed for evaluation:")
-        print(f"  - Input (Prompt) Tokens: {llm_client.token_stats['prompt_tokens']:,}")
-        print(f"  - Output (Completion) Tokens: {llm_client.token_stats['candidates_tokens']:,}")
-        print(f"  - Total Tokens consumed: {llm_client.token_stats['total_tokens']:,}")
-        print("=========================================================\n")
-        return
-        
-    if args.repo and args.pr:
-        run_review_pipeline(args.repo, args.pr, dep_hops=args.dep_hops, get_lines_limit=args.max_context_calls)
-    else:
-        parser.print_help()
-
-if __name__ == "__main__":
-    main()
-===== /root/code-review-agent/app/diff_parser.py =====
+            highest_severity = min((c.severity for c in group), key=lambda s: SEVERITY_RANK.get(s, 99))
+            merged_lines = ["Multiple review concerns identified on this line:\n"]
+            any_ref_id = False
+            highest_confidence = 0.0
+            for item in group:
+                merged_lines.append(f"* **[{item.role}]**: {item.comment.strip()}")
+                if item.references_specific_identifier:
+                    any_ref_id = True
+                highest_confidence = max(highest_confidence, item.confidence)
+            merged_comment = CodeComment(
+                file=file_path, position=pos, severity=highest_severity, role="Multiple",
+                comment="\n".join(merged_lines), confidence=highest_confidence, references_specific_identifier=any_ref_id
+            )
+            deduped.append(merged_comment)
+    return deduped
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/diff_parser.py =====
 import os
 
 IGNORED_EXTENSIONS = {
@@ -1613,36 +241,7 @@ def parse_full_diff(diff_text: str) -> dict:
         files[current_file] = parse_patch("\n".join(patch_lines))
         
     return files
-===== /root/code-review-agent/app/models.py =====
-from pydantic import BaseModel, Field
-from typing import List, Optional
-
-# --- Module G: Aggregation Models ---
-class CodeComment(BaseModel):
-    file: str = Field(..., description="The relative path to the file being reviewed.")
-    position: int = Field(..., description="The exact 1-based diff position of the changed line.")
-    severity: str = Field(..., description="Severity level: P0, P1, P2, or P3.")
-    role: str = Field(..., description="The subagent role that generated the finding (Security, Architecture, Logic, Maintainability, or Multiple).")
-    comment: str = Field(..., description="Constructive code review feedback. Explain what is wrong and provide a concrete solution.")
-    confidence: float = Field(1.0, description="Confidence score from 0.0 to 1.0.")
-    references_specific_identifier: bool = Field(..., description="True if feedback references a specific function name, variable, or class.")
-
-class CodeReviewResponse(BaseModel):
-    comments: List[CodeComment] = Field(default_factory=list)
-
-# --- Module E: Subagent Return Structures ---
-class SubagentFinding(BaseModel):
-    position: int = Field(..., description="1-based diff position of the line needing feedback.")
-    severity: str = Field(..., description="Severity level: P0, P1, P2, or P3.")
-    comment: str = Field(..., description="Critical analysis finding text.")
-    confidence: float = Field(..., description="0.0-1.0: your certainty this is a real, reportable issue.")
-    references_specific_identifier: bool = Field(..., description="True if a specific variable or class name is referenced.")
-    escalated_symbol: Optional[str] = Field(None, description="Provide symbol name (function/class) if additional file definitions are needed.")
-
-class SubagentResponse(BaseModel):
-    status: str = Field(..., description="Return status: 'SUCCESS' if review is completed, or 'NEEDS_CONTEXT' if symbols must be resolved.")
-    findings: List[SubagentFinding] = Field(default_factory=list)
-===== /root/code-review-agent/app/config.py =====
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/config.py =====
 import os
 import json
 import argparse
@@ -1660,10 +259,11 @@ DEFAULT_CONFIG = {
     "CHUNK_TOKEN_TARGET": 5000,
     "MAX_ESCALATION_RETRIES": 1,
     "MAX_ROUTER_CALLS_PER_CHUNK": 1,
-    "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"]
+    "TRIAGE_SKIP_PATTERNS": [".md", ".txt", ".lock", "json", "yaml", "yml", ".png", ".jpg", ".jpeg"],
+    "ENABLE_STATIC_BASELINE": True  # Toggle to include/exclude default static analysis baseline warnings
 }
 
-_debug_mode = False
+_debug_mode = True
 
 def set_debug_mode(enabled: bool):
     global _debug_mode
@@ -1686,15 +286,30 @@ def get_config() -> dict:
                 data.setdefault(k, v)
             return data
     except Exception:
-        return DEFAULT_CONFIG
+        return dict(DEFAULT_CONFIG)
 
 def save_config(data: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    current_data = get_config()
+    
+    # Directly read existing values from file if it exists, bypass get_config() dependency
+    current_data = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                current_data = json.load(f)
+        except Exception:
+            current_data = dict(DEFAULT_CONFIG)
+    else:
+        current_data = dict(DEFAULT_CONFIG)
+        
     current_data.update(data)
     with open(CONFIG_FILE, "w") as f:
         json.dump(current_data, f, indent=4)
-    os.chmod(CONFIG_FILE, 0o600)
+        
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
 
 def get_secret(key: str) -> str:
     val = os.getenv(key)
@@ -1739,16 +354,908 @@ if __name__ == "__main__":
 
     if updates:
         save_config(updates)
-===== /root/code-review-agent/app/orchestrator.py =====
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/models.py =====
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+# --- Module G: Aggregation Models ---
+class CodeComment(BaseModel):
+    file: str = Field(..., description="The relative path to the file being reviewed.")
+    position: int = Field(..., description="The exact 1-based diff position of the changed line.")
+    severity: str = Field(..., description="Severity level: P0, P1, P2, or P3.")
+    role: str = Field(..., description="The subagent role that generated the finding.")
+    comment: str = Field(..., description="Constructive code review feedback. Explain what is wrong and provide a concrete solution.")
+    confidence: float = Field(1.0, description="Confidence score from 0.0 to 1.0.")
+    references_specific_identifier: bool = Field(..., description="True if feedback references a specific function name, variable, or class.")
+
+class CodeReviewResponse(BaseModel):
+    comments: List[CodeComment] = Field(default_factory=list)
+
+# --- Module E: Subagent Return Structures ---
+class ContextRequest(BaseModel):
+    functions: List[str] = Field(default_factory=list, description="Exact names of external functions you need to read.")
+    classes: List[str] = Field(default_factory=list, description="Exact names of classes you need to inspect.")
+    configs: List[str] = Field(default_factory=list, description="Global configuration variables or settings needed.")
+    why: str = Field(..., description="Brief explanation of why this context is required.")
+
+class SubagentFinding(BaseModel):
+    position: int = Field(..., description="1-based diff position of the line needing feedback.")
+    severity: str = Field(..., description="Severity level: P0, P1, P2, or P3.")
+    comment: str = Field(..., description="Critical analysis finding text.")
+    confidence: float = Field(..., description="0.0-1.0: your certainty this is a real, reportable issue.")
+    references_specific_identifier: bool = Field(..., description="True if a specific variable or class name is referenced.")
+    escalated_symbol: Optional[str] = Field(None, description="Provide symbol name if additional file definitions are needed.")
+
+class SubagentResponse(BaseModel):
+    status: str = Field(..., description="Return status: 'SUCCESS' if review is completed, or 'NEEDS_CONTEXT' if symbols must be resolved.")
+    findings: List[SubagentFinding] = Field(default_factory=list)
+    context_request: Optional[ContextRequest] = Field(None, description="Context requested strictly when status is 'NEEDS_CONTEXT'.")
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/prompt_builder.py =====
+from typing import List
+
+def build_subagent_system_instruction(role: str, role_focus: str = "", conventions_text: str = "", static_baseline: str = "") -> str:
+    """
+    Builds a prompt tailored strictly to the SubagentResponse Pydantic schema with calibrated severity guidelines.
+    """
+    instruction = f"""
+You are a critical code reviewer.
+Role: {role} Auditor.
+
+{role_focus}
+
+Domain Priorities:
+- P0: Blocker (exploits, crashes, severe leaks, data loss)
+- P1: Must-fix (logical flaws, correctness bugs, API violations, test errors)
+- P2: Suggestion (perf, structural issues, dead code, refactoring)
+- P3: Suggestion (style, minor readability, spelling, cleanups)
+
+CALIBRATION RULES:
+1. Do NOT upgrade naming, file formatting, or minor style suggestions to P0/P1. Style/refactoring is strictly P2/P3.
+2. If a test is correct but implementation is missing, do NOT assume it fails. Evaluate objectively.
+3. Be highly concise. State the issue and concrete recommendation immediately.
+
+NO-FLATTERY CONSTRAINT:
+- NEVER praise code. Return an empty findings list `[]` if no actionable bug/regression exists.
+- If code is fine, return empty `[]` with status "SUCCESS".
+
+MANDATORY ESCALATION PROTOCOL (VERIFICATION BEFORE AUDITING):
+- If the diff deletes or modifies a test case, test assertion, or public interface contract, and you do NOT see the full implementation code of the tested function, you MUST return 'NEEDS_CONTEXT' with the exact symbol name in context_request.
+- Do NOT guess. Verify first. Speculating without verification is a hallucination.
+
+CONTEXT RETRIEVAL RULES (IF STATUS IS 'NEEDS_CONTEXT'):
+1. Use exact simple names (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`).
+2. Do NOT request context inside 'why' only. You MUST append names in "functions" or "classes" arrays.
+3. Empty arrays mean no context gets retrieved.
+
+Structure response strictly as a single JSON object matching this schema. No markdown outside:
+{{
+  "status": "string ('SUCCESS' or 'NEEDS_CONTEXT')",
+  "findings": [
+    {{
+      "position": int (1-based diff position index),
+      "severity": "string (P0, P1, P2, or P3)",
+      "comment": "string (feedback and recommendation)",
+      "confidence": float (0.0 to 1.0 certainty),
+      "references_specific_identifier": bool,
+      "escalated_symbol": "string (optional)"
+    }}
+  ],
+  "context_request": {{
+    "functions": ["exact external function names needed"],
+    "classes": ["exact class names needed"],
+    "configs": ["exact configuration keys needed"],
+    "why": "brief reasoning"
+  }} (optional: provide strictly if status is 'NEEDS_CONTEXT')
+}}
+"""
+    if static_baseline:
+        instruction += f"\n{static_baseline}\n"
+    if conventions_text:
+        instruction += f"\nCustom rules to enforce:\n{conventions_text}\n"
+    return instruction
+
+def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[str]:
+    hunks = parsed_diff.get("hunks", [])
+    if not hunks:
+        return []
+    lines_repr = []
+    lines_repr.append(f"F: {filepath} ({language})")
+    for idx, hunk in enumerate(hunks):
+        lines_repr.append(f"H{idx+1}: {hunk['header']}")
+        for diff_pos, char, line_num, content in hunk['lines']:
+            # Shorten format to save valuable token space
+            l_num = line_num if line_num is not None else ""
+            lines_repr.append(f"{l_num}:{char}{content} (DP:{diff_pos})")
+    return ["\n".join(lines_repr)]
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/chunker.py =====
+# ===== /root/code-review-agent/app/chunker.py =====
+import os
+import requests
+from app.config import get_config, is_debug_mode
+
+def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            start = max(0, line_range[0] - 1)
+            end = min(len(lines), line_range[1])
+            symbol_lines = lines[start:end]
+            if fallback_only:
+                return symbol_lines[0].strip() if symbol_lines else ""
+            return "".join(symbol_lines)
+        except Exception:
+            pass
+            
+    from app.llm_client import _context
+    owner, repo, token, ref = _context.get("owner"), _context.get("repo"), _context.get("token"), _context.get("commit_sha")
+    if owner and repo and token and ref:
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3.raw"}
+        try:
+            response = requests.get(url, headers=headers, params={"ref": ref})
+            if response.status_code == 200:
+                lines = response.text.splitlines(keepends=True)
+                start = max(0, line_range[0] - 1)
+                end = min(len(lines), line_range[1])
+                symbol_lines = lines[start:end]
+                if fallback_only:
+                    return symbol_lines[0].strip() if symbol_lines else ""
+                return "".join(symbol_lines)
+        except Exception as e:
+            return f"# Remote fallback error loading {filepath}: {e}"
+    return f"# File '{filepath}' not found locally or remote parameters missing."
+
+def get_symbol_neighbors_local(db_path: str, qual_name: str) -> list:
+    """
+    Query-driven helper to fetch direct caller, callee, and dependency targets 
+    from the SQLite database, avoiding circular imports.
+    """
+    if not os.path.exists(db_path):
+        return []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT target_qualified FROM edges 
+            WHERE source_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON', 'IMPORTS_FROM')
+            UNION
+            SELECT DISTINCT source_qualified FROM edges 
+            WHERE target_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')
+        """, (qual_name, qual_name))
+        rows = [r[0] for r in cursor.fetchall() if r[0]]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def get_symbol_neighbors_bfs(db_path: str, seed_symbols: list, max_hops: int = 1) -> set:
+    """
+    BFS outward from seed symbols up to max_hops edges. Returns newly
+    discovered symbols only (seeds excluded).
+    """
+    max_hops = max(1, int(max_hops or 1))
+    visited = set(seed_symbols)
+    frontier = set(seed_symbols)
+    discovered = set()
+    for _ in range(max_hops):
+        next_frontier = set()
+        for sym in frontier:
+            for neighbor in get_symbol_neighbors_local(db_path, sym):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    next_frontier.add(neighbor)
+                    discovered.add(neighbor)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return discovered
+
+def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict, max_hops: int = 1) -> str:
+    config = get_config()
+    token_budget = config.get("DEP_TOKEN_BUDGET", 5000)
+    
+    # Reconstruct the file's diff text safely to verify references
+    diff_text = " ".join(
+        list(parsed_diff.get("added_lines", {}).values()) + 
+        list(parsed_diff.get("context_lines", {}).values())
+    )
+    
+    # Find all symbols defined inside the file under review
+    local_symbols = [name for name, info in symbol_index.items() if info["file_path"] == filepath]
+    if not local_symbols:
+        return ""
+        
+    retrieved_symbols = set()
+    bundle_lines = ["\n--- TRANSITIVE MODULE CONTEXT LOG ---"]
+    accumulated_chars = sum(len(x) for x in bundle_lines)
+    fallback_mode = False
+    
+    from app.llm_client import _context
+    db_path = os.path.join(os.path.abspath(_context.get("workspace") or "."), ".code-review-graph", "graph.db")
+    
+    # BFS lookup for neighbors up to max_hops
+    candidate_neighbors = get_symbol_neighbors_bfs(db_path, local_symbols, max_hops=max_hops)
+    
+    for neighbor_sym in candidate_neighbors:
+        if (accumulated_chars / 4) >= token_budget:
+            break
+            
+        if neighbor_sym in retrieved_symbols or neighbor_sym in local_symbols:
+            continue
+            
+        # Filter: only pull the symbol's body if it is referenced inside the diff text
+        simple_name = neighbor_sym.split("::")[-1]
+        if simple_name not in diff_text:
+            continue
+            
+        if neighbor_sym in symbol_index:
+            retrieved_symbols.add(neighbor_sym)
+            meta = symbol_index[neighbor_sym]
+            line_range = meta.get("line_range", [1, 20])
+            content = get_symbol_signature_or_content(meta["file_path"], line_range, fallback_only=fallback_mode)
+            
+            if (accumulated_chars + len(content)) / 4 > token_budget:
+                fallback_mode = True
+                content = get_symbol_signature_or_content(meta["file_path"], line_range, fallback_only=True)
+                payload = f"\nDependency Signature '{neighbor_sym}' ({line_range[0]}-{line_range[1]}):\n{content}"
+            else:
+                payload = f"\nDependency '{neighbor_sym}' ({line_range[0]}-{line_range[1]}):\n{content}"
+            bundle_lines.append(payload)
+            accumulated_chars += len(payload)
+                
+    if is_debug_mode():
+        print(f"[DEBUG] [Chunker] Context compile complete. Size: {accumulated_chars} chars (~{int(accumulated_chars/4)} tokens).")
+    return "\n".join(bundle_lines) if len(bundle_lines) > 1 else ""
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/repo_intelligence.py =====
+import os
+import json
+import argparse
+import sqlite3
+import subprocess
+import shutil
+from pathlib import Path
+from app.config import is_debug_mode
+from app.profiler import PipelineProfiler
+
+INTEL_DIR = Path.home() / ".config" / "code_review_agent" / "repo_intel"
+
+def make_rel(path_str: str, base_dir: str) -> str:
+    """
+    Safely converts an absolute path string to a relative path string 
+    relative to base_dir, normalizing all slashes.
+    """
+    if not path_str:
+        return ""
+    try:
+        rel = os.path.relpath(path_str, base_dir)
+        return rel.replace("\\", "/")
+    except ValueError:
+        return path_str.replace("\\", "/")
+
+def build_repo_intelligence(repo_dir: str, commit_sha: str) -> str:
+    """
+    Invokes code-review-graph (CRG) to index the repository. Leverages sub-second 
+    incremental updates if a database is already present.
+    """
+    profiler = PipelineProfiler()
+    repo_path = Path(repo_dir).resolve()
+    repo_path_str = str(repo_path)
+    db_path = repo_path / ".code-review-graph" / "graph.db"
+    
+    print(f"[RepoIntel] Building repository intelligence for Commit: {commit_sha} inside {repo_path}")
+    
+    stdout_dest = None if is_debug_mode() else subprocess.PIPE
+    stderr_dest = None if is_debug_mode() else subprocess.PIPE
+    
+    # Profile external CLI tool executions
+    profiler.start("RepoIntel: code-review-graph CLI")
+    try:
+        if db_path.exists():
+            print(f"[RepoIntel] Database found at {db_path}. Executing fast incremental update...", flush=True)
+            res = subprocess.run(
+                ["code-review-graph", "update"], 
+                cwd=repo_path_str, 
+                stdout=stdout_dest, 
+                stderr=stderr_dest, 
+                text=True
+            )
+        else:
+            print(f"[RepoIntel] No database found. Executing full codebase build...", flush=True)
+            res = subprocess.run(
+                ["code-review-graph", "build"], 
+                cwd=repo_path_str, 
+                stdout=stdout_dest, 
+                stderr=stderr_dest, 
+                text=True
+            )
+            
+        if res.returncode != 0:
+            print(f"[RepoIntel] code-review-graph command failed with exit code: {res.returncode}")
+    except Exception as e:
+        print(f"[RepoIntel] Failed to execute code-review-graph CLI operation: {e}")
+        profiler.stop("RepoIntel: code-review-graph CLI")
+        return ""
+    profiler.stop("RepoIntel: code-review-graph CLI")
+
+    if not db_path.exists():
+        print(f"[RepoIntel] Error: SQLite graph database not found at {db_path}")
+        return ""
+
+    symbol_index = {}
+    dependency_graph = {}
+
+    # Profile parsing the AST graph tables inside SQLite
+    profiler.start("RepoIntel: DB Node/Edge Parsing")
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT name, qualified_name, file_path, line_start, line_end, kind 
+            FROM nodes 
+            WHERE kind != 'File'
+        """)
+        nodes = cursor.fetchall()
+        for node in nodes:
+            line_range = [node["line_start"] or 1, node["line_end"] or 1]
+            rel_file = make_rel(node["file_path"], repo_path_str)
+            
+            qual_name = node["qualified_name"]
+            if "::" in qual_name:
+                parts = qual_name.split("::", 1)
+                rel_part = make_rel(parts[0], repo_path_str)
+                qual_name = f"{rel_part}::{parts[1]}"
+            else:
+                qual_name = make_rel(qual_name, repo_path_str)
+                
+            symbol_meta = {
+                "file_path": rel_file,
+                "line_range": line_range,
+                "type": node["kind"].lower()
+            }
+            symbol_index[qual_name] = symbol_meta
+
+        cursor.execute("SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL")
+        files = cursor.fetchall()
+        for f in files:
+            rel_f = make_rel(f["file_path"], repo_path_str)
+            dependency_graph[rel_f] = {
+                "imports": [],
+                "imported_by": []
+            }
+
+        node_to_file = {}
+        cursor.execute("SELECT qualified_name, file_path FROM nodes WHERE file_path IS NOT NULL")
+        for row in cursor.fetchall():
+            node_to_file[row["qualified_name"]] = row["file_path"]
+
+        cursor.execute("""
+            SELECT 
+                e.source_qualified,
+                e.target_qualified,
+                n_src.file_path AS src_file,
+                n_tgt.file_path AS tgt_file
+            FROM edges e
+            LEFT JOIN nodes n_src ON e.source_qualified = n_src.qualified_name
+            LEFT JOIN nodes n_tgt ON e.target_qualified = n_tgt.qualified_name
+            WHERE e.kind IN ('IMPORTS_FROM', 'DEPENDS_ON')
+        """)
+        edges = cursor.fetchall()
+        for edge in edges:
+            src_file_abs = edge["src_file"] or node_to_file.get(edge["source_qualified"])
+            tgt_file_abs = edge["tgt_file"] or node_to_file.get(edge["target_qualified"])
+
+            if src_file_abs and tgt_file_abs:
+                src_file = make_rel(src_file_abs, repo_path_str)
+                tgt_file = make_rel(tgt_file_abs, repo_path_str)
+                
+                if src_file != tgt_file:
+                    dependency_graph.setdefault(src_file, {"imports": [], "imported_by": []})
+                    dependency_graph.setdefault(tgt_file, {"imports": [], "imported_by": []})
+
+                    if tgt_file not in dependency_graph[src_file]["imports"]:
+                        dependency_graph[src_file]["imports"].append(tgt_file)
+                    if src_file not in dependency_graph[tgt_file]["imported_by"]:
+                        dependency_graph[tgt_file]["imported_by"].append(src_file)
+
+                    if tgt_file.endswith(".py"):
+                        dot_tgt = tgt_file[:-3].replace("/", ".")
+                    else:
+                        dot_tgt = tgt_file.replace("/", ".")
+                        
+                    if src_file.endswith(".py"):
+                        dot_src = src_file[:-3].replace("/", ".")
+                    else:
+                        dot_src = src_file.replace("/", ".")
+
+                    if dot_tgt not in dependency_graph[src_file]["imports"]:
+                        dependency_graph[src_file]["imports"].append(dot_tgt)
+                    if dot_src not in dependency_graph[tgt_file]["imported_by"]:
+                        dependency_graph[tgt_file]["imported_by"].append(dot_src)
+
+        conn.close()
+    except Exception as e:
+        print(f"[RepoIntel] Failed to process database nodes and edges: {e}")
+        profiler.stop("RepoIntel: DB Node/Edge Parsing")
+        return ""
+    profiler.stop("RepoIntel: DB Node/Edge Parsing")
+
+    if not symbol_index and not dependency_graph:
+        print("[RepoIntel] Warning: Empty symbol index. Aborting write.")
+        return ""
+
+    INTEL_DIR.mkdir(parents=True, exist_ok=True)
+    out_file = INTEL_DIR / f"{commit_sha}.json"
+    
+    # Save a permanent copy of the SQLite database inside the cache folder
+    cache_db_file = INTEL_DIR / f"{commit_sha}.db"
+    if db_path.exists():
+        try:
+            shutil.copy(str(db_path), str(cache_db_file))
+            print(f"[RepoIntel] Saved database copy to {cache_db_file}", flush=True)
+        except Exception as e:
+            print(f"[RepoIntel] Failed to copy database to cache: {e}", flush=True)
+    
+    payload = {
+        "commit_sha": commit_sha,
+        "symbol_index": symbol_index,
+        "dependency_graph": dependency_graph
+    }
+    
+    with open(out_file, "w") as f:
+        json.dump(payload, f, indent=4)
+        
+    print(f"Repo Intelligence generated successfully via CRG for Commit: {commit_sha}")
+    return str(out_file)
+
+def load_repo_intelligence(commit_sha: str) -> dict:
+    intel_file = INTEL_DIR / f"{commit_sha}.json"
+    if intel_file.exists():
+        try:
+            with open(intel_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"symbol_index": {}, "dependency_graph": {}}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Build repository-wide static indices.")
+    parser.add_argument("--repo-dir", default=".", help="Root of local workspace")
+    parser.add_argument("--commit", required=True, help="Target Commit SHA key")
+    args = parser.parse_args()
+    build_repo_intelligence(args.repo_dir, args.commit)
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/output_parser.py =====
+import json
+from typing import List
+from app.models import CodeReviewResponse, CodeComment
+
+# Map raw severities directly to P-level labels
+SEVERITY_LABELS = {
+    "P0": "Blocker (P0)",
+    "P1": "Must-fix-before-merge (P1)",
+    "P2": "Suggestion (P2)",
+    "P3": "Suggestion (P3)"
+}
+
+def parse_and_sort_comments(raw_text: str) -> List[CodeComment]:
+    try:
+        cleaned_text = raw_text.strip()
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        if cleaned_text.startswith("```"):
+            cleaned_text = cleaned_text[3:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+            
+        cleaned_text = cleaned_text.strip()
+        data = json.loads(cleaned_text)
+        
+        if isinstance(data, dict) and "comments" in data:
+            raw_comments = data["comments"]
+        elif isinstance(data, list):
+            raw_comments = data
+        else:
+            raw_comments = []
+            
+        comments = []
+        for item in raw_comments:
+            try:
+                comment = CodeComment(**item)
+                comments.append(comment)
+            except Exception:
+                pass
+                
+        severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+        comments.sort(key=lambda c: severity_order.get(c.severity, 99))
+        return comments
+    except Exception as e:
+        raise ValueError(f"Parsing failed for raw text structure: {e}\nRaw output: {raw_text}")
+
+def format_terminal_output(comments: List[CodeComment]):
+    print("\n================== TERMINAL REVIEW RESULTS ==================")
+    for c in comments:
+        label = SEVERITY_LABELS.get(c.severity, "Suggestion")
+        ref_id = " (References Identifier)" if c.references_specific_identifier else ""
+        print(f"[{label}] ({c.role}) File: {c.file} | Diff Position: {c.position}{ref_id}")
+        print(f"Feedback: {c.comment}")
+        print("-" * 60)
+    print("=============================================================\n")
+
+def build_github_review_payload(comments: List[CodeComment]) -> List[dict]:
+    gh_comments = []
+    
+    # Sort review findings strictly by severity (P0 -> P3)
+    severity_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    comments.sort(key=lambda c: severity_order.get(c.severity, 99))
+    
+    for c in comments:
+        label = SEVERITY_LABELS.get(c.severity, "Suggestion")
+        
+        # Format header based on whether the comment card is coalesced or single-agent
+        if c.role == "Multiple":
+            header = f"### ⚠️ [{label}] Coalesced Findings"
+        else:
+            header = f"### ⚠️ [{label}] ({c.role}) Finding"
+            
+        body = f"{header}\n\n{c.comment}"
+        gh_comments.append({
+            "path": c.file,
+            "position": c.position,
+            "body": body
+        })
+    return gh_comments
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/triage.py =====
+# ===== /root/code-review-agent/app/triage.py =====
+import os
+import sys
+import subprocess
+from app.config import get_config
+from app.diff_parser import is_ignored_file
+from app.profiler import PipelineProfiler
+
+def evaluate_docs_only_skip(changed_files: list) -> bool:
+    if not changed_files:
+        return True
+        
+    config = get_config()
+    skip_extensions = config.get("TRIAGE_SKIP_PATTERNS", [])
+    
+    for f in changed_files:
+        if is_ignored_file(f):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in skip_extensions:
+            return False
+            
+    return True
+
+# Comprehensive compiler and static logic checks
+COMPILER_REGISTRY = {
+    ".py": {
+        "lang": "Python",
+        "cmd": lambda files: [sys.executable or "python3", "-m", "py_compile"] + files,
+        # Secondary static rules to execute if available on the VM
+        "linters": [
+            {"exec": "ruff", "args": lambda files: ["ruff", "check", "--no-fix"] + files},
+            {"exec": "mypy", "args": lambda files: ["mypy", "--ignore-missing-imports"] + files}
+        ]
+    },
+    ".js": {
+        "lang": "JavaScript",
+        "cmd": lambda files: ["node", "--check"] + files,
+        "linters": [
+            {"exec": "eslint", "args": lambda files: ["npx", "eslint"] + files}
+        ]
+    },
+    ".ts": {
+        "lang": "TypeScript",
+        "cmd": lambda files: ["tsc", "--noEmit"] + files
+    },
+    ".go": {
+        "lang": "Go",
+        "cmd": lambda files: ["go", "vet", "./..."]
+    },
+    ".rs": {
+        "lang": "Rust",
+        "cmd": lambda files: ["cargo", "check"]
+    }
+}
+
+def is_executable_available(name: str) -> bool:
+    try:
+        subprocess.run(["which", name], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+def run_native_compile_check(changed_files: list, workspace_path: str = ".") -> dict:
+    """
+    Runs compiler/syntax passes, followed by local lint/static checkers if available.
+    """
+    profiler = PipelineProfiler()
+    errors = []
+    failed_languages = set()
+    
+    grouped_files = {}
+    for f in changed_files:
+        if not os.path.exists(f):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext in COMPILER_REGISTRY:
+            grouped_files.setdefault(ext, []).append(f)
+            
+    for ext, files in grouped_files.items():
+        rule = COMPILER_REGISTRY[ext]
+        lang_name = rule["lang"]
+        cmd_generator = rule["cmd"]
+        
+        # 1. Run mandatory base compilation checks
+        cmd = cmd_generator(files)
+        executable = cmd[0]
+        
+        if not is_executable_available(executable):
+            print(f"[Triage] Compiler '{executable}' not found on VM. Skipping check.")
+            continue
+            
+        profiler.start(f"Triage Compiler: {lang_name} native check")
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=workspace_path)
+        profiler.stop(f"Triage Compiler: {lang_name} native check")
+        
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            errors.append(f"[{lang_name} Syntax Error]\n{err}")
+            failed_languages.add(lang_name)
+            continue  # Re-raise compile errors immediately
+            
+        # 2. Run runtime static assertions (e.g. Ruff/Mypy/Eslint) if present
+        for linter in rule.get("linters", []):
+            lexec = linter["exec"]
+            if is_executable_available(lexec):
+                profiler.start(f"Triage Linter: {lang_name} {lexec} check")
+                lcmd = linter["args"](files)
+                lres = subprocess.run(lcmd, capture_output=True, text=True, cwd=workspace_path)
+                profiler.stop(f"Triage Linter: {lang_name} {lexec} check")
+                if lres.returncode != 0:
+                    lerr = lres.stderr.strip() or lres.stdout.strip()
+                    errors.append(f"[{lang_name} {lexec.capitalize()} Logic/Type Error]\n{lerr}")
+                    failed_languages.add(lang_name)
+
+    if errors:
+        langs_str = " & ".join(sorted(failed_languages))
+        header = f"### ❌ Local Triage Verification Failed\nStatic validation failed on changed **{langs_str}** files. Build-level issues must be resolved before triggering AI code reviews."
+        body = "\n\n".join(errors[:10])
+        if len(errors) > 10:
+            body += f"\n\n*+ {len(errors) - 10} more errors output truncated*"
+            
+        full_message = f"{header}\n\n```text\n{body[:1800]}\n```"
+        return {"passed": False, "error_msg": full_message}
+
+    return {"passed": True, "error_msg": ""}
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/llm_client.py =====
+# ===== /root/code-review-agent/app/llm_client.py =====
+import os
+import time
+import threading
+import requests
+from google import genai
+from google.genai import types
+from app.config import get_secret, is_debug_mode, get_config
+from app.profiler import PipelineProfiler
+
+_context = {
+    "owner": "",
+    "repo": "",
+    "token": "",
+    "commit_sha": ""
+}
+
+_lock = threading.Lock()
+get_lines_counter = 0
+get_lines_limit = 2
+_gatekeeper_ref = None
+
+token_stats = {
+    "prompt_tokens": 0,
+    "candidates_tokens": 0,
+    "total_tokens": 0
+}
+
+def get_lines(file: str, start: int, end: int) -> str:
+    """
+    Escalation option to fetch full file content lines.
+    """
+    global get_lines_counter, get_lines_limit
+    
+    with _lock:
+        if get_lines_limit != -1 and get_lines_counter >= get_lines_limit:
+            if is_debug_mode():
+                print(f"[DEBUG] [get_lines Tool] LLM requested get_lines('{file}', {start}, {end}) but limit is reached.")
+            return f"Error: Call limit exceeded (maximum {get_lines_limit} invocations of get_lines allowed)."
+        get_lines_counter += 1
+        
+    if is_debug_mode():
+        print(f"[DEBUG] [get_lines Tool] LLM invoked get_lines(file='{file}', start={start}, end={end}) [Call #{get_lines_counter}]")
+
+    content = ""
+    
+    workspace = _context.get("workspace")
+    target_path = os.path.join(workspace, file) if workspace else file
+    
+    if os.path.exists(target_path):
+        try:
+            with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            start_idx = max(0, start - 1)
+            end_idx = min(len(lines), end)
+            content = "".join(lines[start_idx:end_idx])
+        except Exception:
+            pass
+            
+    if not content:
+        owner = _context.get("owner")
+        repo = _context.get("repo")
+        token = _context.get("token")
+        ref = _context.get("commit_sha")
+        
+        if owner and repo and token and ref:
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file}"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.v3.raw"
+            }
+            params = {"ref": ref}
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    lines = response.text.splitlines(keepends=True)
+                    start_idx = max(0, start - 1)
+                    end_idx = min(len(lines), end)
+                    content = "".join(lines[start_idx:end_idx])
+            except Exception:
+                pass
+                
+    if not content:
+        return f"Error: File '{file}' not found locally or remote parameters missing."
+
+    content_tokens = int(len(content) / 4)
+    if _gatekeeper_ref:
+        profiler = PipelineProfiler()
+        start_gatekeeper_wait = time.perf_counter()
+        while True:
+            can_go, wait_time = _gatekeeper_ref.can_consume(content_tokens)
+            if can_go:
+                _gatekeeper_ref.record_call(content_tokens)
+                break
+            if is_debug_mode():
+                print(f"[DEBUG] [get_lines Tool] Quota threshold near. Delaying tool content return. Pausing thread for {wait_time:.1f}s...")
+            time.sleep(wait_time)
+        gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
+        if gatekeeper_wait_duration > 0.01:
+            profiler.record("Gatekeeper Wait: Tool API throttling", gatekeeper_wait_duration)
+            
+    return content
+
+def reset_telemetry_counters(limit: int = 2):
+    global get_lines_counter, get_lines_limit
+    with _lock:
+        get_lines_counter = 0
+        get_lines_limit = limit
+
+def reset_token_stats():
+    with _lock:
+        token_stats["prompt_tokens"] = 0
+        token_stats["candidates_tokens"] = 0
+        token_stats["total_tokens"] = 0
+
+def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
+    profiler = PipelineProfiler()
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not defined. Run `python -m app.config --set-gemini` to configure it.")
+        
+    client = genai.Client(api_key=api_key)
+    model_name = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
+    
+    config_kwargs = {
+        "temperature": 0.1,
+        "system_instruction": system_instruction,
+    }
+    
+    if response_schema is not None:
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = response_schema
+    else:
+        config_kwargs["tools"] = [get_lines]
+        
+    config = types.GenerateContentConfig(**config_kwargs)
+    
+    max_retries = 3
+    retry_delay = 5
+    
+    if is_debug_mode():
+        # Display the full input context being sent to the LLM
+        print("\n" + "="*40 + " LLM PROMPT INPUT " + "="*40, flush=True)
+        print(f"[System Instruction]\n{system_instruction}\n", flush=True)
+        print(f"[Prompt Payload]\n{prompt}", flush=True)
+        print("="*98 + "\n", flush=True)
+        
+    # Standardize rate limit consumption check across all types of API requests (Pass 1, Pass 2, Symbols, Chunks, Routers)
+    prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
+    if _gatekeeper_ref:
+        start_gatekeeper_wait = time.perf_counter()
+        while True:
+            can_go, wait_time = _gatekeeper_ref.can_consume(prompt_tokens)
+            if can_go:
+                _gatekeeper_ref.record_call(prompt_tokens)
+                break
+            if is_debug_mode():
+                print(f"[DEBUG] [Gatekeeper] Throttling active. Pausing thread for {wait_time:.1f}s...")
+            time.sleep(wait_time)
+        gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
+        if gatekeeper_wait_duration > 0.01:
+            profiler.record("Gatekeeper Wait: RPM/TPM throttling", gatekeeper_wait_duration)
+            
+    response = None
+    tid = threading.get_ident()
+    profiler.start("LLM API Call: Network Duration", thread_id=f"api_{tid}")
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config
+            )
+            break
+        except Exception as e:
+            error_str = str(e)
+            is_transient = (
+                "503" in error_str or 
+                "429" in error_str or 
+                "UNAVAILABLE" in error_str or 
+                "RESOURCE_EXHAUSTED" in error_str or
+                "quota" in error_str.lower()
+            )
+            
+            if is_transient and attempt < max_retries - 1:
+                print(f"[LLM Client] Quota/Transient error on attempt {attempt+1}. Retrying in {retry_delay} seconds... Error: {error_str.splitlines()[0]}")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                profiler.stop("LLM API Call: Network Duration", thread_id=f"api_{tid}")
+                raise e
+                
+    profiler.stop("LLM API Call: Network Duration", thread_id=f"api_{tid}")
+    
+    if not response or not response.text:
+        raise RuntimeError("LLM returned an empty response.")
+        
+    usage = response.usage_metadata
+    if usage:
+        with _lock:
+            token_stats["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
+            token_stats["candidates_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+            token_stats["total_tokens"] += getattr(usage, "total_token_count", 0) or 0
+            if is_debug_mode():
+                print(f"[DEBUG] [LLM Client] Call finished. Tokens used in turn: {getattr(usage, 'total_token_count', 0)}", flush=True)
+        
+    return response.text
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/orchestrator.py =====
+# ===== /root/code-review-agent/app/orchestrator.py =====
 import json
 import os
+import re
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from app.models import SubagentResponse, CodeComment
 from app.llm_client import call_gemini
 from app.prompt_builder import build_subagent_system_instruction
-from app.repo_intelligence import load_repo_intelligence
 from app.chunker import get_symbol_signature_or_content
-from app.config import is_debug_mode
+from app.config import get_config, is_debug_mode
+from app.profiler import PipelineProfiler
 
 STATIC_ANALYSIS_BASELINE = """
 This diff has ALREADY passed: ruff-format/ruff-lint, pyright, semgrep, gitleaks,
@@ -1776,14 +1283,180 @@ SUBAGENT_PROMPTS = {
     )
 }
 
+class SharedContextCache:
+    def __init__(self, workspace_path: str):
+        self.workspace_path = workspace_path
+        self.cache = {}
+
+    def contains(self, qual_name: str) -> bool:
+        return qual_name in self.cache
+
+    def get_body(self, qual_name: str) -> str:
+        return self.cache.get(qual_name, {}).get("body", "")
+
+    def get_metadata(self, qual_name: str) -> dict:
+        return self.cache.get(qual_name, {}).get("metadata", {})
+
+    def add(self, qual_name: str, metadata: dict, body: str):
+        self.cache[qual_name] = {"metadata": metadata, "body": body}
+
+# --- Path Alignment Helpers ---
+
+def make_rel_path(path_str: str, workspace_dir: str) -> str:
+    """Normalizes an absolute path to a relative representation."""
+    if not path_str:
+        return ""
+    try:
+        rel = os.path.relpath(path_str, workspace_dir)
+        return rel.replace("\\", "/")
+    except ValueError:
+        return path_str.replace("\\", "/")
+
+def make_rel_qual_name(qual_name: str, workspace_dir: str) -> str:
+    """Converts absolute qualified names from SQLite nodes to relative strings."""
+    if "::" in qual_name:
+        parts = qual_name.split("::", 1)
+        rel_part = make_rel_path(parts[0], workspace_dir)
+        return f"{rel_part}::{parts[1]}"
+    else:
+        return make_rel_path(qual_name, workspace_dir)
+
+def make_abs_qual_name(qual_name: str, workspace_dir: str) -> str:
+    """Converts relative in-memory qualified names back to absolute for database indexing."""
+    if "::" in qual_name:
+        parts = qual_name.split("::", 1)
+        abs_part = os.path.abspath(os.path.join(workspace_dir, parts[0])).replace("\\", "/")
+        return f"{abs_part}::{parts[1]}"
+    else:
+        return os.path.abspath(os.path.join(workspace_dir, qual_name)).replace("\\", "/")
+
+# --- Database & Ast Index Queries ---
+
+def get_changed_symbols_in_file(db_path: str, filepath_abs: str, modified_lines: list) -> list:
+    changed_symbols = []
+    if not os.path.exists(db_path) or not modified_lines:
+        return changed_symbols
+    
+    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT name, qualified_name, line_start, line_end, kind 
+            FROM nodes WHERE file_path = ? AND kind != 'File'
+        """, (filepath_abs,))
+        for node in cursor.fetchall():
+            l_start, l_end = node["line_start"] or 1, node["line_end"] or 1
+            if any(l_start <= line <= l_end for line in modified_lines):
+                # Ensure the qualified name returned is relative to match symbol_index keys
+                rel_qual = make_rel_qual_name(node["qualified_name"], workspace_dir)
+                changed_symbols.append({
+                    "name": node["name"],
+                    "qualified_name": rel_qual,
+                    "line_range": [l_start, l_end],
+                    "kind": node["kind"].lower()
+                })
+        conn.close()
+    except Exception as e:
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Changed symbol matching failed: {e}")
+    return changed_symbols
+
+def get_symbol_neighbors(db_path: str, qual_name: str, max_hops: int = 1) -> dict:
+    neighbors = {"callers": [], "callees": [], "classes": []}
+    if not os.path.exists(db_path):
+        return neighbors
+    
+    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+    # Convert incoming relative qualified name to absolute to match SQLite contents
+    abs_qual_name = make_abs_qual_name(qual_name, workspace_dir)
+    max_hops = max(1, int(max_hops or 1))
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Keep classes (IMPORTS_FROM) single-hop only
+        cursor.execute("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind = 'IMPORTS_FROM'", (abs_qual_name,))
+        neighbors["classes"] = [make_rel_qual_name(r[0], workspace_dir) for r in cursor.fetchall() if r[0]]
+        
+        # Traverse callers and callees (CALLS, DEPENDS_ON) up to max_hops via BFS
+        def bfs(direction_sql: str) -> set:
+            visited, frontier = {abs_qual_name}, {abs_qual_name}
+            for _ in range(max_hops):
+                nxt = set()
+                for sym in frontier:
+                    cursor.execute(direction_sql, (sym,))
+                    for r in cursor.fetchall():
+                        if r[0] and r[0] not in visited:
+                            visited.add(r[0])
+                            nxt.add(r[0])
+                if not nxt:
+                    break
+                frontier = nxt
+            visited.discard(abs_qual_name)
+            return visited
+            
+        callees = bfs("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')")
+        callers = bfs("SELECT DISTINCT source_qualified FROM edges WHERE target_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')")
+        
+        neighbors["callees"] = [make_rel_qual_name(s, workspace_dir) for s in callees]
+        neighbors["callers"] = [make_rel_qual_name(s, workspace_dir) for s in callers]
+        
+        conn.close()
+    except Exception:
+        pass
+    return neighbors
+
+def populate_cache_for_symbol(db_path: str, qual_name: str, symbol_index: dict, cache: SharedContextCache, dep_hops: int = 1):
+    if qual_name in symbol_index and not cache.contains(qual_name):
+        meta = symbol_index[qual_name]
+        body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
+        cache.add(qual_name, meta, body)
+    neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
+    for caller in neighbors["callers"]:
+        if caller in symbol_index and not cache.contains(caller):
+            meta = symbol_index[caller]
+            body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
+            cache.add(caller, meta, body)
+    for callee in neighbors["callees"]:
+        if callee in symbol_index and not cache.contains(callee):
+            meta = symbol_index[callee]
+            body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
+            cache.add(callee, meta, body)
+    for cls in neighbors["classes"]:
+        if cls in symbol_index and not cache.contains(cls):
+            meta = symbol_index[cls]
+            body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=True)
+            cache.add(cls, meta, body)
+
+def compile_symbol_bundle(qual_name: str, cache: SharedContextCache, neighbors: dict) -> str:
+    lines = [f"\n--- SYMBOL-CENTRIC CONTEXT: {qual_name} ---"]
+    if cache.contains(qual_name):
+        lines.append(f"\nChanged Symbol implementation:\n{cache.get_body(qual_name)}")
+    for caller in neighbors["callers"]:
+        if cache.contains(caller):
+            lines.append(f"\nDirect Caller '{caller}':\n{cache.get_body(caller)}")
+    for callee in neighbors["callees"]:
+        if cache.contains(callee):
+            lines.append(f"\nDirect Callee '{callee}':\n{cache.get_body(callee)}")
+    for cls in neighbors["classes"]:
+        if cache.contains(cls):
+            lines.append(f"\nRelated Class interface '{cls}':\n{cache.get_body(cls)}")
+    return "\n".join(lines)
+
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
     if is_debug_mode():
-        print(f"[DEBUG] [Orchestrator] Spawning parallel worker thread for subagent: '{role}'")
-        
+        print(f"[DEBUG] [Orchestrator] Spawning worker: '{role}'", flush=True)
     role_focus = SUBAGENT_PROMPTS.get(role, "")
-    role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, STATIC_ANALYSIS_BASELINE)
-    prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     
+    # Dynamically verify if static baseline is enabled
+    config = get_config()
+    baseline = STATIC_ANALYSIS_BASELINE if config.get("ENABLE_STATIC_BASELINE", True) else ""
+    
+    role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
+    prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     try:
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
         cleaned = raw_out.strip()
@@ -1794,15 +1467,17 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
         
-        data = json.loads(cleaned.strip())
-        resp = SubagentResponse(**data)
+        resp = SubagentResponse(**json.loads(cleaned.strip()))
         
         if is_debug_mode():
-            print(f"[DEBUG] [Orchestrator] Subagent '{role}' returned successfully. Findings: {len(resp.findings)}")
+            print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
+            print(raw_out, flush=True)
+            print("-"*98 + "\n", flush=True)
+            print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
             
         return resp
     except Exception as e:
-        print(f"Subagent {role} failed: {e}")
+        print(f"Subagent {role} failed: {e}", flush=True)
         return SubagentResponse(status="SUCCESS", findings=[])
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
@@ -1816,254 +1491,774 @@ def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -
 def crg_search_symbols(db_path: str, query: str, limit: int = 10) -> list:
     results = []
     if not os.path.exists(db_path):
-        if is_debug_mode():
-            print(f"[DEBUG] [crg_search_symbols] SQLite database not found at {db_path}")
         return results
     try:
-        import sqlite3
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        
-        sanitized_query = "".join([c if c.isalnum() or c in " _-" else " " for c in query]).strip()
-        
+        sanitized = "".join([c if c.isalnum() or c in " _-" else " " for c in query]).strip()
         try:
-            if is_debug_mode():
-                print(f"[DEBUG] [crg_search_symbols] Attempting FTS5 database search for query: '{sanitized_query}'")
             cursor.execute("""
-                SELECT n.name, n.file_path, n.line_start, n.line_end, n.qualified_name
-                FROM nodes n
-                JOIN nodes_fts fts ON n.id = fts.rowid
-                WHERE nodes_fts MATCH ?
-                LIMIT ?
-            """, (sanitized_query, limit))
-            rows = cursor.fetchall()
-            for r in rows:
-                results.append({
-                    "name": r[0],
-                    "file_path": r[1],
-                    "line_range": [r[2] or 1, r[3] or 1],
-                    "qualified_name": r[4]
-                })
-            if is_debug_mode():
-                print(f"[DEBUG] [crg_search_symbols] FTS5 search succeeded. Retrieved {len(results)} matches.")
-        except Exception as fts_error:
-            if is_debug_mode():
-                print(f"[DEBUG] [crg_search_symbols] FTS5 search failed, falling back to substring matching. Error: {fts_error}")
-            
-            like_pattern = f"%{query}%"
+                SELECT n.name, n.file_path, n.line_start, n.line_end, n.qualified_name FROM nodes n
+                JOIN nodes_fts fts ON n.id = fts.rowid WHERE fts.nodes_fts MATCH ? LIMIT ?
+            """, (sanitized, limit))
+            for r in cursor.fetchall():
+                results.append({"name": r[0], "file_path": r[1], "line_range": [r[2] or 1, r[3] or 1], "qualified_name": r[4]})
+        except Exception:
             cursor.execute("""
-                SELECT name, file_path, line_start, line_end, qualified_name
-                FROM nodes
-                WHERE kind != 'File' AND (name LIKE ? OR qualified_name LIKE ?)
-                LIMIT ?
-            """, (like_pattern, like_pattern, limit))
-            rows = cursor.fetchall()
-            for r in rows:
-                results.append({
-                    "name": r[0],
-                    "file_path": r[1],
-                    "line_range": [r[2] or 1, r[3] or 1],
-                    "qualified_name": r[4]
-                })
-            if is_debug_mode():
-                print(f"[DEBUG] [crg_search_symbols] Substring search completed. Retrieved {len(results)} matches.")
+                SELECT name, file_path, line_start, line_end, qualified_name FROM nodes
+                WHERE kind != 'File' AND (name LIKE ? OR qualified_name LIKE ?) LIMIT ?
+            """, (f"%{query}%", f"%{query}%", limit))
+            for r in cursor.fetchall():
+                results.append({"name": r[0], "file_path": r[1], "line_range": [r[2] or 1, r[3] or 1], "qualified_name": r[4]})
         conn.close()
-    except Exception as e:
-        if is_debug_mode():
-            print(f"[DEBUG] [crg_search_symbols] Database operation failed: {e}")
+    except Exception:
+        pass
     return results
 
-def resolve_escalation(escalated_symbols: list, symbol_index: dict) -> str:
-    resolved_findings = []
-    vague_requests = []
+def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_rounds: int = 1) -> list:
+    """
+    Consolidated multi-pass loop orchestrator. Loops dynamically through context escalations
+    and resolves symbol queries up to max_rounds [3].
+    """
+    profiler = PipelineProfiler()
+    roles = ["Architecture", "Logic", "Security"]
     
-    if is_debug_mode():
-        print(f"[DEBUG] [Resolver] Resolving escalated symbols: {escalated_symbols}")
-        
-    for sym in escalated_symbols:
-        if sym in symbol_index:
-            info = symbol_index[sym]
-            content = get_symbol_signature_or_content(info["file_path"], info["line_range"])
-            resolved_findings.append(f"--- Resolved Symbol Definition ({sym}) ---\n{content}")
-            if is_debug_mode():
-                print(f"[DEBUG] [Resolver]   - Found exact local index match for '{sym}' inside '{info['file_path']}'")
-        else:
-            vague_requests.append(sym)
-            
-    if vague_requests:
-        from app.llm_client import _context
-        workspace = _context.get("workspace") or "."
-        db_path = os.path.join(workspace, ".code-review-graph", "graph.db")
-        
-        candidates = []
-        for v_req in vague_requests:
-            search_results = crg_search_symbols(db_path, v_req, limit=5)
-            for res in search_results:
-                rel_file = os.path.relpath(res["file_path"], workspace).replace("\\", "/")
-                
-                qual_name = res["qualified_name"]
-                if "::" in qual_name:
-                    parts = qual_name.split("::", 1)
-                    try:
-                        rel_part = os.path.relpath(parts[0], workspace).replace("\\", "/")
-                        qual_name = f"{rel_part}::{parts[1]}"
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        qual_name = os.path.relpath(qual_name, workspace).replace("\\", "/")
-                    except Exception:
-                        pass
-                
-                candidates.append(
-                    f"Symbol: {qual_name} | File: {rel_file} | Range: {res['line_range']}"
-                )
-                    
-        if candidates:
-            if is_debug_mode():
-                print(f"[DEBUG] [Resolver]   - Vague symbol match failed exact lookup. Candidates identified: {len(candidates)}. Executing router call...")
-            router_match = run_escalation_routing_llm(vague_requests, "\n".join(candidates[:10]))
-            resolved_findings.append(f"--- Router Resolved Candidates ---\n{router_match}")
-            
-    return "\n\n".join(resolved_findings)
-
-def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict) -> list:
-    roles = ["Architecture", "Logic", "Security"]  # Security subagent added
-    
-    with ThreadPoolExecutor(max_workers=3) as executor:  # Thread pool increased to 3
+    # Profile Pass 1 Parallel LLM calls
+    profiler.start("Orchestrator: Pass 1 Parallel LLM Reviews")
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
         results = {futures[f]: f.result() for f in futures}
+    profiler.stop("Orchestrator: Pass 1 Parallel LLM Reviews")
         
-    escalated_symbols = []
-    escalated_roles = []
-    
-    tracked_findings = {}
-    
+    escalated_symbols, escalated_roles, tracked_findings = [], [], {}
     for role, resp in results.items():
         for f in resp.findings:
             tracked_findings[(role, f.position)] = f
-            if f.escalated_symbol:
-                escalated_symbols.append(f.escalated_symbol)
+        if resp.status == "NEEDS_CONTEXT" and resp.context_request:
+            req = resp.context_request
+            functions_req = list(req.functions)
+            classes_req = list(req.classes)
+            
+            # Enforce configuration key constraint if defined
+            config = get_config()
+            max_calls = config.get("MAX_ROUTER_CALLS_PER_CHUNK", 1)
+            
+            # Fallback natural language text extractor - refined to avoid noisy 4-letter word capture
+            if not functions_req and not classes_req and req.why:
+                why_symbols = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", req.why)
+                candidate_words = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", req.why)
+                for w in candidate_words:
+                    if w.lower() not in ["functions", "classes", "why", "context", "symbol", "definition", "implementation"]:
+                        why_symbols.append(w)
                 
-        if resp.status == "NEEDS_CONTEXT":
+                for w_sym in why_symbols[:max_calls]:
+                    functions_req.append(w_sym)
+                        
             escalated_roles.append(role)
+            escalated_symbols.extend(functions_req + classes_req + req.configs)
 
-    if escalated_symbols and len(escalated_roles) > 0:
-        if is_debug_mode():
-            print(f"[DEBUG] [Orchestrator] Escalation requested by subagents {escalated_roles}. Initiating context resolver pass...")
-        augmented_context = resolve_escalation(escalated_symbols, symbol_index)
-        retry_payload = f"{chunk_payload}\n\n--- Escalated Resolved Context ---\n{augmented_context}"
+    round_idx = 0
+    payload = chunk_payload
+    
+    # Dynamic multi-round escalation loop
+    while escalated_symbols and escalated_roles and round_idx < max_rounds:
+        profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
+        newly_retrieved_context = []
+        for sym in escalated_symbols:
+            if cache.contains(sym):
+                newly_retrieved_context.append(f"--- Cached Symbol Definition ({sym}) ---\n{cache.get_body(sym)}")
+            elif sym in symbol_index:
+                meta = symbol_index[sym]
+                body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
+                cache.add(sym, meta, body)
+                newly_retrieved_context.append(f"--- Resolved Symbol Definition ({sym}) ---\n{body}")
+            else:
+                # 1. Search the active HEAD database
+                search_results = crg_search_symbols(db_path, sym, limit=5)
+                exact_match = None
+                for res in search_results:
+                    if res["name"] == sym:
+                        exact_match = res
+                        break
+                target_node = exact_match if exact_match else (search_results[0] if search_results else None)
+                if target_node:
+                    rel_file = os.path.relpath(target_node["file_path"], cache.workspace_path).replace("\\", "/")
+                    body = get_symbol_signature_or_content(rel_file, target_node["line_range"], fallback_only=False)
+                    cache.add(sym, {"file_path": rel_file, "line_range": target_node["line_range"]}, body)
+                    newly_retrieved_context.append(f"--- Search Resolved Symbol Definition ({sym}) ---\n{body}")
+                else:
+                    # 2. Symbol is deleted from HEAD. Query the pre-change BASE database to check for dangling imports!
+                    from app.llm_client import _context
+                    base_sha = _context.get("base_sha")
+                    from app.repo_intelligence import INTEL_DIR
+                    base_db_path = os.path.join(INTEL_DIR, f"{base_sha}.db") if base_sha else ""
+                    
+                    base_callers = []
+                    if base_db_path and os.path.exists(base_db_path):
+                        try:
+                            conn = sqlite3.connect(base_db_path)
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                SELECT DISTINCT source_qualified FROM edges 
+                                WHERE (target_qualified = ? OR target_qualified LIKE ?) 
+                                  AND kind IN ('IMPORTS_FROM', 'CALLS', 'DEPENDS_ON')
+                            """, (sym, f"%::{sym}"))
+                            base_callers = [os.path.basename(r[0].split("::")[0]) for r in cursor.fetchall() if r[0]]
+                            conn.close()
+                        except Exception:
+                            pass
+                    
+                    if base_callers:
+                        clean_callers = list(set(base_callers))
+                        err_msg = f"Notice: Symbol '{sym}' was DELETED in this commit. Pre-change (BASE) commit caller graph analysis shows it was imported/referenced only by these files: {clean_callers}."
+                    else:
+                        err_msg = f"Notice: Symbol '{sym}' does not exist in the active HEAD commit and had no registered baseline callers."
+                        
+                    newly_retrieved_context.append(f"--- Symbol Deletion Notice ({sym}) ---\n{err_msg}")
+
+        augmented = "\n\n".join(newly_retrieved_context)
+        payload = f"{payload}\n\n--- Escalated Resolved Context (Pass {round_idx + 2}) ---\n{augmented}"
+        profiler.stop(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         
+        # Profile subsequent escalation rounds
+        profiler.start(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        next_roles, next_symbols = [], []
         with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
-            retry_futures = {executor.submit(run_single_subagent, role, retry_payload, conventions_text): role for role in escalated_roles}
+            retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
             for rf in retry_futures:
                 role = retry_futures[rf]
                 resp = rf.result()
-                
                 for f in resp.findings:
                     tracked_findings[(role, f.position)] = f
+                if resp.status == "NEEDS_CONTEXT" and resp.context_request:
+                    req = resp.context_request
+                    funcs, classes = list(req.functions), list(req.classes)
+                    if funcs or classes or req.configs:
+                        next_roles.append(role)
+                        next_symbols.extend(funcs + classes + req.configs)
+                        
+        profiler.stop(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        escalated_roles, escalated_symbols = next_roles, next_symbols
+        round_idx += 1
 
     final_comments = []
     for (role, position), f in tracked_findings.items():
         if f.comment and f.comment.strip():
             final_comments.append(CodeComment(
-                file="",
-                position=f.position,
-                severity=f.severity,
-                role=role,
-                comment=f.comment,
-                confidence=f.confidence,
-                references_specific_identifier=f.references_specific_identifier
+                file="", position=f.position, severity=f.severity, role=role,
+                comment=f.comment, confidence=f.confidence, references_specific_identifier=f.references_specific_identifier
             ))
-        
     return final_comments
-===== /root/code-review-agent/app/validator.py =====
-import re
-from app.models import CodeComment
 
-SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-REPORT_THRESHOLD = SEVERITY_RANK["P2"]
-CONFIDENCE_THRESHOLD = 0.6
-
-def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
-    """
-    Checks if specific code symbols referenced in backticks exist in the active diff lines.
-    """
-    all_text = " ".join(
-        list(parsed_diff_file.get("added_lines", {}).values()) + 
-        list(parsed_diff_file.get("context_lines", {}).values())
-    )
-    candidates = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", comment)
-    if not candidates:
-        return True  # No symbols declared to verify, skip penalization
-    return any(c in all_text for c in candidates)
-
-def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_diff_file: dict) -> list:
-    """
-    Module G: Evaluates line locations, gates on confidence limits, performs identifier
-    grounding, demotes ungrounded feedback, enforces severity floors, and aggregates findings.
-    """
-    valid_comments = []
-    valid_positions = parsed_diff_file.get("valid_positions", set())
+def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventions_text: str, cache: SharedContextCache, db_path: str, dep_hops: int = 1, max_escalation_rounds: int = 1) -> list:
+    qual_name = changed_symbol["qualified_name"]
+    populate_cache_for_symbol(db_path, qual_name, symbol_index, cache, dep_hops=dep_hops)
+    neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
+    symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
+    chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
     
-    for f in findings:
-        f.file = file_path
-        
-        # 1. Location Boundary Check
-        if f.position not in valid_positions:
-            print(f"[Validator] Rejected hallucinated comment position {f.position} on {file_path}")
-            continue
-            
-        # 2. Confidence Gate Check
-        if f.confidence < CONFIDENCE_THRESHOLD:
-            continue
-            
-        # 3. Specificity Grounding Check
-        if f.references_specific_identifier:
-            if not is_identifier_grounded(f.comment, parsed_diff_file):
-                old_sev = f.severity
-                # Demote by exactly one severity tier
-                f.severity = {"P0": "P1", "P1": "P2", "P2": "P3", "P3": "P3"}.get(f.severity, "P3")
-                print(f"[Validator] Ungrounded symbol reference detected. Demoted {old_sev} -> {f.severity}.")
+    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
 
-        # 4. Enforce Severity Floor (suppress P3 entirely)
-        if SEVERITY_RANK.get(f.severity, 99) > REPORT_THRESHOLD:
-            continue
-            
-        valid_comments.append(f)
+def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_escalation_rounds: int = 1) -> list:
+    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/gatekeeper.py =====
+import time
+import threading
+from app.config import get_config
 
-    # 5. Group and Deduplicate remaining findings
-    grouped_by_pos = {}
-    for c in valid_comments:
-        grouped_by_pos.setdefault(c.position, []).append(c)
+class RateGatekeeper:
+    def __init__(self):
+        self.call_history = []
+        self.daily_count = 0
+        self.last_day_timestamp = time.time()
+        # Shared lock to synchronize rate tracking across subagent worker threads
+        self._lock = threading.Lock()
+
+    def update_window(self):
+        now = time.time()
+        self.call_history = [call for call in self.call_history if now - call[0] < 60]
         
-    deduped = []
-    for pos, group in grouped_by_pos.items():
-        if len(group) == 1:
-            deduped.append(group[0])
+        if now - self.last_day_timestamp >= 86400:
+            self.daily_count = 0
+            self.last_day_timestamp = now
+
+    def can_consume(self, estimated_tokens: int) -> tuple:
+        with self._lock:  # Mutex protection
+            self.update_window()
+            config = get_config()
+            
+            max_rpm = config.get("MAX_RPM", 12)
+            max_tpm = config.get("MAX_TPM", 200000)
+            max_rpd = config.get("MAX_RPD", 400)
+            
+            if self.daily_count >= max_rpd:
+                return False, 3600.0
+                
+            current_rpm = len(self.call_history)
+            current_tpm = sum(call[1] for call in self.call_history)
+            
+            if current_rpm >= max_rpm or (current_tpm + estimated_tokens) >= max_tpm:
+                if self.call_history:
+                    oldest_timestamp = self.call_history[0][0]
+                    sleep_duration = max(0.1, 60.1 - (time.time() - oldest_timestamp))
+                    return False, sleep_duration
+                return False, 5.0
+                
+            return True, 0.0
+
+    def record_call(self, tokens_used: int):
+        with self._lock:  # Mutex protection
+            self.update_window()
+            self.call_history.append((time.time(), tokens_used))
+            self.daily_count += 1
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/repo_checks.py =====
+import os
+import re
+import requests
+from typing import List
+
+def read_local_file(filename: str) -> str:
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            pass
+    return ""
+
+def fetch_github_file(owner: str, repo: str, filename: str, token: str) -> str:
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filename}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3.raw"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.text
+    except Exception:
+        pass
+    return ""
+
+def get_repo_conventions(owner: str = None, repo: str = None, token: str = None) -> str:
+    for name in ["AGENTS.md", "CLAUDE.md"]:
+        content = read_local_file(name)
+        if content:
+            return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
+            
+    if owner and repo and token:
+        for name in ["AGENTS.md", "CLAUDE.md"]:
+            content = fetch_github_file(owner, repo, name, token)
+            if content:
+                return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
+    return ""
+
+def validate_commit_format(commit_message: str) -> bool:
+    if not commit_message:
+        return False
+    first_line = commit_message.splitlines()[0].strip()
+    pattern = r"^(feat|fix|chore|docs|refactor|style|test|ci)(\(.+\))?:\s+.{3,}"
+    return bool(re.match(pattern, first_line, re.IGNORECASE))
+
+def fetch_and_validate_commits(owner: str, repo: str, pr_number: str, token: str) -> List[str]:
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+    suggestions = []
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            commits = response.json()
+            for c in commits:
+                msg = c.get("commit", {}).get("message", "")
+                sha = c.get("sha", "")[:7]
+                if not validate_commit_format(msg):
+                    suggestions.append(
+                        f"Commit `{sha}` ('{msg.splitlines()[0]}') is non-compliant. Format requires `<type>: <desc>` (what and why)."
+                    )
+    except Exception as e:
+        print(f"Warning: Commit checking errored: {e}")
+    return suggestions
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/main.py =====
+# ===== /root/code-review-agent/app/main.py =====
+import os
+import sys
+import argparse
+import requests
+import json
+import threading
+import time
+import subprocess
+import shutil
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor
+
+# Config and parsers
+from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode
+from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
+from app.prompt_builder import chunk_file_diffs
+import app.llm_client as llm_client
+from app.models import CodeComment
+from app.output_parser import build_github_review_payload
+from app.repo_checks import get_repo_conventions
+
+# Import Phase 2 Modules
+from app.repo_intelligence import load_repo_intelligence, build_repo_intelligence
+from app.triage import evaluate_docs_only_skip, run_native_compile_check
+from app.chunker import compile_dependency_bundle
+from app.gatekeeper import RateGatekeeper
+from app.orchestrator import (
+    orchestrate_chunk_review, 
+    orchestrate_symbol_review, 
+    SharedContextCache, 
+    get_changed_symbols_in_file
+)
+from app.validator import validate_and_deduplicate_comments
+from app.profiler import PipelineProfiler
+
+gatekeeper = RateGatekeeper()
+
+def fetch_repo_metadata(owner: str, repo: str, token: str) -> dict:
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return {}
+
+def fetch_pr_metadata(owner: str, repo: str, pr_number: str, token: str) -> dict:
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to fetch PR metadata. API Status: {response.status_code}")
+    return response.json()
+
+def fetch_all_pr_files(owner: str, repo: str, pr_number: str, token: str) -> list:
+    all_files, page = [], 1
+    while True:
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+        response = requests.get(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, params={"page": page, "per_page": 100})
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to fetch PR files. API Status: {response.status_code}")
+        data = response.json()
+        if not data:
+            break
+        all_files.extend(data)
+        if len(data) < 100:
+            break
+        page += 1
+    return all_files
+
+def post_github_review(owner: str, repo: str, pr_number: str, token: str, commit_id: str, comments: list, body_summary: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
+    if not comments:
+        response = requests.post(url, headers=headers, json={"commit_id": commit_id, "event": "COMMENT", "body": body_summary, "comments": []})
+        if response.status_code not in [200, 201]:
+            print(f"Failed to post review summary. Status: {response.status_code}")
+        return
+    comment_batches = [comments[i:i + 8] for i in range(0, len(comments), 8)]
+    for idx, batch in enumerate(comment_batches, 1):
+        batch_body = body_summary if idx == 1 else f"### 🛡️ Phase 2 Inline Code Review [Batch {idx}/{len(comment_batches)}]"
+        response = requests.post(url, headers=headers, json={"commit_id": commit_id, "event": "COMMENT", "body": batch_body, "comments": batch})
+        if response.status_code not in [200, 201]:
+            print(f"Failed to post batch {idx}. Status: {response.status_code}")
+        if idx < len(comment_batches):
+            time.sleep(2.0)
+
+def ensure_local_checkout(owner: str, repo_name: str, commit_sha: str, token: str) -> str:
+    cache_dir = Path.home() / ".cache" / "code_review_agent" / "repos" / owner / repo_name
+    workspace_path = str(cache_dir)
+    if cache_dir.exists() and not (cache_dir / ".git").exists():
+        try:
+            shutil.rmtree(cache_dir)
+        except Exception:
+            pass
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not (cache_dir / ".git").exists():
+        clone_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+        res = subprocess.run(["git", "clone", clone_url, workspace_path], capture_output=True, text=True)
+        if res.returncode != 0:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "clone", f"https://github.com/{owner}/{repo_name}.git", workspace_path], check=True)
+    else:
+        subprocess.run(["git", "reset", "--hard"], cwd=workspace_path, capture_output=True)
+        subprocess.run(["git", "clean", "-fd", "-e", ".code-review-graph"], cwd=workspace_path, capture_output=True)
+        subprocess.run(["git", "fetch", "origin"], cwd=workspace_path, capture_output=True)
+    res = subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, capture_output=True, text=True)
+    if res.returncode != 0:
+        subprocess.run(["git", "fetch", "--unshallow"], cwd=workspace_path, capture_output=True)
+        subprocess.run(["git", "checkout", commit_sha], cwd=workspace_path, check=True)
+    return workspace_path
+
+def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, max_escalation_rounds: int = 1):
+    print(f"\n[Pipeline] Initializing Review for {repo_full_name} PR #{pr_number}", flush=True)
+    start_time = time.time()
+    
+    profiler = PipelineProfiler()
+    profiler.start("Pipeline: Full Process Execution")
+    
+    try:
+        # Reset token telemetry variables once per PR pipeline execution
+        llm_client.reset_token_stats()
+
+        token = get_repo_pat(repo_full_name)
+        if not token:
+            print(f"[Pipeline] Error: GITHUB_PAT not configured.", flush=True)
+            return
+        owner, repo = repo_full_name.split("/")
+        
+        # Profile repo metadata parsing
+        profiler.start("GitHub API: Retrieve PR/Repository Metadata")
+        repo_meta = fetch_repo_metadata(owner, repo, token)
+        repo_size_kb = repo_meta.get("size", 0)
+        pr_data = fetch_pr_metadata(owner, repo, pr_number, token)
+        if pr_data.get("draft") is True:
+            profiler.stop("GitHub API: Retrieve PR/Repository Metadata")
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+        commit_id = pr_data.get("head", {}).get("sha")
+        base_sha = pr_data.get("base", {}).get("sha")
+        pr_files = fetch_all_pr_files(owner, repo, pr_number, token)
+        profiler.stop("GitHub API: Retrieve PR/Repository Metadata")
+        
+        # Profile Git Checkout of Head Commit
+        profiler.start("Git Checkout: HEAD Commit Retrieval")
+        workspace_path = ensure_local_checkout(owner, repo, commit_id, token)
+        profiler.stop("Git Checkout: HEAD Commit Retrieval")
+        
+        # Populate context keys cleanly
+        llm_client._context.update({
+            "owner": owner, 
+            "repo": repo, 
+            "token": token, 
+            "commit_sha": commit_id, 
+            "workspace": workspace_path,
+            "base_sha": base_sha
+        })
+        llm_client._gatekeeper_ref = gatekeeper
+        
+        # Fetch / build the HEAD commit index
+        profiler.start("RepoIntel Build: Head Commit AST Index")
+        intel_data = load_repo_intelligence(commit_id)
+        if not intel_data.get("symbol_index") or not intel_data.get("dependency_graph"):
+            print(f"[RepoIntel] Index for HEAD commit '{commit_id}' is missing. Generating...", flush=True)
+            build_repo_intelligence(workspace_path, commit_id)
+            intel_data = load_repo_intelligence(commit_id)
+        profiler.stop("RepoIntel Build: Head Commit AST Index")
+            
+        # Also ensure base_sha database is indexed so we can query base callers during deletion escalations
+        profiler.start("RepoIntel Build: Base Commit AST Index")
+        base_intel = load_repo_intelligence(base_sha)
+        if not base_intel.get("symbol_index") or not base_intel.get("dependency_graph"):
+            print(f"[RepoIntel] Index for BASE commit '{base_sha}' is missing. Generating...", flush=True)
+            ensure_local_checkout(owner, repo, base_sha, token)
+            build_repo_intelligence(workspace_path, base_sha)
+            ensure_local_checkout(owner, repo, commit_id, token)
+        profiler.stop("RepoIntel Build: Base Commit AST Index")
+            
+        symbol_index = intel_data.get("symbol_index", {})
+        dependency_graph = intel_data.get("dependency_graph", {})
+        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
+        
+        if evaluate_docs_only_skip(changed_file_paths):
+            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+            
+        # Profile compilation step using explicit thread-safe cwd pathways (no os.chdir)
+        profiler.start("Triage validation: Local Compilers & Linters")
+        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
+        profiler.stop("Triage validation: Local Compilers & Linters")
+        
+        if not compile_status["passed"]:
+            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+            
+        conventions = get_repo_conventions(owner, repo, token)
+        db_path = os.path.join(workspace_path, ".code-review-graph", "graph.db")
+        
+        # Instantiate shared cache context
+        cache = SharedContextCache(workspace_path)
+        review_tasks = []
+        total_diff_lines = 0
+        
+        # 1. Map changed files to task payloads
+        for f in pr_files:
+            filename = f.get("filename")
+            patch = f.get("patch")
+            if is_ignored_file(filename) or not patch:
+                continue
+                
+            total_diff_lines += len(patch.splitlines())
+            lang = identify_language(filename)
+            parsed_diff = parse_patch(patch)
+            
+            filepath_abs = os.path.abspath(os.path.join(workspace_path, filename)).replace("\\", "/")
+            modified_lines = list(parsed_diff.get("added_lines", {}).keys())
+            
+            changed_symbols = get_changed_symbols_in_file(db_path, filepath_abs, modified_lines)
+            
+            if changed_symbols:
+                for sym in changed_symbols:
+                    review_tasks.append({
+                        "type": "symbol",
+                        "filename": filename,
+                        "parsed_diff": parsed_diff,
+                        "sym": sym
+                    })
+            else:
+                chunks = chunk_file_diffs(filename, lang, parsed_diff)
+                for chunk in chunks:
+                    dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
+                    payload = f"{chunk}\n\n{dep_bundle}"
+                    review_tasks.append({
+                        "type": "chunk",
+                        "filename": filename,
+                        "parsed_diff": parsed_diff,
+                        "payload": payload
+                    })
+
+        # 2. Worker task executor
+        def execute_review_task(task):
+            filename = task["filename"]
+            parsed_diff = task["parsed_diff"]
+            
+            if task["type"] == "symbol":
+                sym = task["sym"]
+                print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
+                symbol_comments = orchestrate_symbol_review(
+                    sym, symbol_index, conventions, cache, db_path,
+                    dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds
+                )
+                return validate_and_deduplicate_comments(symbol_comments, filename, parsed_diff)
+            else:
+                payload = task["payload"]
+                print(f"[Pipeline] Analysing file chunks: '{filename}'...", flush=True)
+                chunk_comments = orchestrate_chunk_review(
+                    payload, conventions, symbol_index, db_path, cache,
+                    max_escalation_rounds=max_escalation_rounds
+                )
+                return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
+
+        # 3. Parallelize the reviews across thread pools safely protected by central RateGatekeeper
+        all_comments = []
+        if review_tasks:
+            profiler.start("Pipeline: Parallel LLM Task Execution")
+            with ThreadPoolExecutor(max_workers=min(len(review_tasks), 4)) as executor:
+                task_results = executor.map(execute_review_task, review_tasks)
+                for res in task_results:
+                    all_comments.extend(res)
+            profiler.stop("Pipeline: Parallel LLM Task Execution")
+
+        gh_comments = build_github_review_payload(all_comments)
+        summary_body = "### 🛡️ Phase 2 Code Review Complete\n\nAll findings have been batched and mapped directly to lines."
+                
+        if gh_comments:
+            profiler.start("GitHub API: Post review comments payload")
+            post_github_review(owner, repo, pr_number, token, commit_id, gh_comments, summary_body)
+            profiler.stop("GitHub API: Post review comments payload")
+            
+        elapsed_time = time.time() - start_time
+        profiler.stop("Pipeline: Full Process Execution")
+        
+        profiler.report()
+        
+        print("\n================== PERFORMANCE METRICS ==================", flush=True)
+        print(f"Repository size: {repo_size_kb:,} KB" if repo_size_kb else "Repository size: Unknown", flush=True)
+        print(f"PR Diff size: {total_diff_lines:,} total lines", flush=True)
+        print(f"Execution Latency: {elapsed_time:.2f} seconds", flush=True)
+        print(f"Tokens consumed:\n  - Input: {llm_client.token_stats['prompt_tokens']:,}\n  - Output: {llm_client.token_stats['candidates_tokens']:,}\n  - Total: {llm_client.token_stats['total_tokens']:,}", flush=True)
+        print("=========================================================\n", flush=True)
+    except Exception as e:
+        profiler.stop("Pipeline: Full Process Execution")
+        print(f"[Pipeline] Crash: {e}", flush=True)
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        print(f"\n[Webhook] Received incoming POST request on '{self.path}'", flush=True)
+        
+        if self.path != "/webhook":
+            print(f"[Webhook] Rejected: Path is not '/webhook' (received '{self.path}')", flush=True)
+            self.send_response(404)
+            self.end_headers()
+            return
+            
+        event_type = self.headers.get('X-GitHub-Event', '')
+        print(f"[Webhook] GitHub Event Header ('X-GitHub-Event'): '{event_type}'", flush=True)
+        
+        post_data = self.rfile.read(int(self.headers.get('Content-Length', 0) or 0))
+        try:
+            payload = json.loads(post_data.decode('utf-8'))
+        except Exception as e:
+            print(f"[Webhook] Error: Failed to parse JSON payload: {e}", flush=True)
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        if event_type == 'ping':
+            print("[Webhook] Received 'ping' event from GitHub. Connection is healthy!", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+
+        if event_type != 'pull_request':
+            print(f"[Webhook] Ignored: Event is not 'pull_request' (received '{event_type}')", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+            
+        action = payload.get("action")
+        is_draft = payload.get("pull_request", {}).get("draft", False)
+        print(f"[Webhook] Pull Request Action parsed correctly: '{action}', Draft: {is_draft}", flush=True)
+        
+        if action not in ["opened", "synchronize", "ready_for_review"] or is_draft is True:
+            print(f"[Webhook] Ignored: Action '{action}' is not tracked or PR is currently in draft.", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+            
+        repo_full_name = payload.get("repository", {}).get("full_name")
+        pr_number = payload.get("number")
+        if repo_full_name and pr_number:
+            print(f"[Webhook] Triggering PR review pipeline for '{repo_full_name}' PR #{pr_number}", flush=True)
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=run_review_pipeline, args=(repo_full_name, str(pr_number), server_dep_hops, server_lines_limit)).start()
         else:
-            # Match the highest severity on the row
-            highest_severity = min((c.severity for c in group), key=lambda s: SEVERITY_RANK.get(s, 99))
-            
-            merged_lines = ["Multiple review concerns identified on this line:\n"]
-            any_ref_id = False
-            highest_confidence = 0.0
-            
-            for item in group:
-                merged_lines.append(f"* **[{item.role}]**: {item.comment.strip()}")
-                if item.references_specific_identifier:
-                    any_ref_id = True
-                highest_confidence = max(highest_confidence, item.confidence)
-                    
-            merged_comment = CodeComment(
-                file=file_path,
-                position=pos,
-                severity=highest_severity,
-                role="Multiple",
-                comment="\n".join(merged_lines),
-                confidence=highest_confidence,
-                references_specific_identifier=any_ref_id
-            )
-            deduped.append(merged_comment)
-            
-    return deduped
+            print(f"[Webhook] Bad Request: Repository name or PR number missing.", flush=True)
+            self.send_response(400)
+            self.end_headers()
+
+server_dep_hops, server_lines_limit = 1, 1  # Default to 1-hop and 1-round limits
+
+def main():
+    global server_dep_hops, server_lines_limit
+    parser = argparse.ArgumentParser(description="Phase 2 Code Review Agent")
+    parser.add_argument("--repo")
+    parser.add_argument("--pr")
+    parser.add_argument("--diff-file")
+    parser.add_argument("--server", action="store_true")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--build-index", action="store_true")
+    parser.add_argument("--commit")
+    parser.add_argument("--dep-hops", type=int, default=1)  # Default to 1-hop for free tier limitations
+    parser.add_argument("--max-context-calls", type=int, default=1) # Max additional escalation rounds a subagent may request (default 1)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+    
+    if args.build_index:
+        if not args.commit:
+            sys.exit(1)
+        build_repo_intelligence(".", args.commit)
+        return
+    server_dep_hops = args.dep_hops
+    server_lines_limit = args.max_context_calls
+    if args.debug:
+        set_debug_mode(True)
+    if args.server:
+        server = HTTPServer(('0.0.0.0', args.port), WebhookHandler)
+        print(f"Webhook Receiver active on port {args.port} (Hops: {server_dep_hops}, Context Calls: {server_lines_limit})...", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("Server shutting down.", flush=True)
+        return
+    if args.diff_file:
+        start_time = time.time()
+        try:
+            with open(args.diff_file, "r") as f:
+                diff_text = f.read()
+        except Exception:
+            sys.exit(1)
+        llm_client.reset_telemetry_counters()
+        parsed_files = parse_full_diff(diff_text)
+        all_comments = []
+        conventions = get_repo_conventions()
+        total_diff_lines = len(diff_text.splitlines())
+        
+        # Instantiate a mock offline cache
+        cache = SharedContextCache(".")
+        
+        for filepath, data in parsed_files.items():
+            if is_ignored_file(filepath):
+                continue
+            lang = identify_language(filepath)
+            chunks = chunk_file_diffs(filepath, lang, data)
+            for chunk in chunks:
+                try:
+                    comments = orchestrate_chunk_review(
+                        chunk, conventions, symbol_index={}, db_path=".", cache=cache,
+                        max_escalation_rounds=args.max_context_calls
+                    )
+                    all_comments.extend(validate_and_deduplicate_comments(comments, filepath, data))
+                except Exception:
+                    pass
+        elapsed_time = time.time() - start_time
+        print("\n================== PERFORMANCE METRICS ==================", flush=True)
+        print(f"PR Diff size: {total_diff_lines:,} total lines", flush=True)
+        print(f"Execution Latency: {elapsed_time:.2f} seconds", flush=True)
+        print(f"Tokens consumed:\n  - Input: {llm_client.token_stats['prompt_tokens']:,}\n  - Output: {llm_client.token_stats['candidates_tokens']:,}\n  - Total: {llm_client.token_stats['total_tokens']:,}", flush=True)
+        print("=========================================================\n", flush=True)
+        return
+    if args.repo and args.pr:
+        run_review_pipeline(args.repo, args.pr, dep_hops=args.dep_hops, max_escalation_rounds=args.max_context_calls)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+===== /Users/advikasrivastava/code-review-agent/code-review-agent/app/profiler.py =====
+import time
+import threading
+from collections import defaultdict
+
+class PipelineProfiler:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if not cls._instance:
+                cls._instance = super(PipelineProfiler, cls).__new__(cls, *args, **kwargs)
+                cls._instance.metrics = defaultdict(float)
+                cls._instance.starts = {}
+                cls._instance.lock = threading.Lock()
+            return cls._instance
+
+    def start(self, phase: str, thread_id: str = "main"):
+        key = f"{phase}::{thread_id}"
+        with self.lock:
+            self.starts[key] = time.perf_counter()
+
+    def stop(self, phase: str, thread_id: str = "main"):
+        key = f"{phase}::{thread_id}"
+        with self.lock:
+            if key in self.starts:
+                elapsed = time.perf_counter() - self.starts[key]
+                self.metrics[phase] += elapsed
+                del self.starts[key]
+
+    def record(self, phase: str, duration: float):
+        with self.lock:
+            self.metrics[phase] += duration
+
+    def report(self):
+        with self.lock:
+            print("\n" + "=" * 25 + " PIPELINE PROFILER METRICS " + "=" * 25)
+            sorted_metrics = sorted(self.metrics.items(), key=lambda x: x[1], reverse=True)
+            total = sum(self.metrics.values())
+            for phase, duration in sorted_metrics:
+                pct = (duration / total * 100) if total > 0 else 0
+                print(f" - {phase:<45}: {duration:7.3f}s ({pct:5.1f}%)")
+            print(f" - Total Profiled Execution Duration           : {total:7.3f}s")
+            print("=" * 77 + "\n")

@@ -1,8 +1,10 @@
+# ===== /root/code-review-agent/app/triage.py =====
 import os
 import sys
 import subprocess
 from app.config import get_config
 from app.diff_parser import is_ignored_file
+from app.profiler import PipelineProfiler
 
 def evaluate_docs_only_skip(changed_files: list) -> bool:
     if not changed_files:
@@ -59,10 +61,11 @@ def is_executable_available(name: str) -> bool:
     except Exception:
         return False
 
-def run_native_compile_check(changed_files: list) -> dict:
+def run_native_compile_check(changed_files: list, workspace_path: str = ".") -> dict:
     """
     Runs compiler/syntax passes, followed by local lint/static checkers if available.
     """
+    profiler = PipelineProfiler()
     errors = []
     failed_languages = set()
     
@@ -87,7 +90,10 @@ def run_native_compile_check(changed_files: list) -> dict:
             print(f"[Triage] Compiler '{executable}' not found on VM. Skipping check.")
             continue
             
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        profiler.start(f"Triage Compiler: {lang_name} native check")
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=workspace_path)
+        profiler.stop(f"Triage Compiler: {lang_name} native check")
+        
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
             errors.append(f"[{lang_name} Syntax Error]\n{err}")
@@ -98,8 +104,10 @@ def run_native_compile_check(changed_files: list) -> dict:
         for linter in rule.get("linters", []):
             lexec = linter["exec"]
             if is_executable_available(lexec):
+                profiler.start(f"Triage Linter: {lang_name} {lexec} check")
                 lcmd = linter["args"](files)
-                lres = subprocess.run(lcmd, capture_output=True, text=True)
+                lres = subprocess.run(lcmd, capture_output=True, text=True, cwd=workspace_path)
+                profiler.stop(f"Triage Linter: {lang_name} {lexec} check")
                 if lres.returncode != 0:
                     lerr = lres.stderr.strip() or lres.stdout.strip()
                     errors.append(f"[{lang_name} {lexec.capitalize()} Logic/Type Error]\n{lerr}")

@@ -1,3 +1,4 @@
+# ===== /root/code-review-agent/app/chunker.py =====
 import os
 import requests
 from app.config import get_config, is_debug_mode
@@ -35,98 +36,105 @@ def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_on
             return f"# Remote fallback error loading {filepath}: {e}"
     return f"# File '{filepath}' not found locally or remote parameters missing."
 
-def get_recursive_dependencies(filepath: str, dependency_graph: dict, max_hops: int = 1) -> set:
-    resolved_files = set()
-    if is_debug_mode():
-        print(f"[DEBUG] [Chunker] Resolving dependencies (Max Hops: {max_hops})")
-        
-    if dependency_graph:
-        queue = [(filepath, 0)]
-        visited = {filepath}
-        while queue:
-            curr_file, hop = queue.pop(0)
-            if max_hops != -1 and hop >= max_hops:
-                continue
-            imports = dependency_graph.get(curr_file, {}).get("imports", [])
-            for imp in imports:
-                imp_file = imp.replace(".", "/") + ".py" if ("." in imp or not imp.endswith(".py")) else imp
-                if imp_file in dependency_graph and imp_file not in visited:
-                    visited.add(imp_file)
-                    if imp_file != filepath:
-                        resolved_files.add(imp_file)
-                    queue.append((imp_file, hop + 1))
-        return resolved_files
+def get_symbol_neighbors_local(db_path: str, qual_name: str) -> list:
+    """
+    Query-driven helper to fetch direct caller, callee, and dependency targets 
+    from the SQLite database, avoiding circular imports.
+    """
+    if not os.path.exists(db_path):
+        return []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT target_qualified FROM edges 
+            WHERE source_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON', 'IMPORTS_FROM')
+            UNION
+            SELECT DISTINCT source_qualified FROM edges 
+            WHERE target_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')
+        """, (qual_name, qual_name))
+        rows = [r[0] for r in cursor.fetchall() if r[0]]
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
-    from app.llm_client import _context
-    workspace_abs = os.path.abspath(_context.get("workspace") or ".")
-    db_path = os.path.join(workspace_abs, ".code-review-graph", "graph.db")
-    if os.path.exists(db_path):
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            filepath_abs = os.path.abspath(os.path.join(workspace_abs, filepath)).replace("\\", "/")
-            queue = [(filepath_abs, 0)]
-            visited = {filepath_abs}
-            while queue:
-                curr_target, hop = queue.pop(0)
-                if max_hops != -1 and hop >= max_hops:
-                    continue
-                cursor.execute("""
-                    SELECT DISTINCT e.target_qualified, n.file_path FROM edges e
-                    JOIN nodes n ON n.qualified_name = e.target_qualified
-                    WHERE (e.source_qualified = ? OR e.file_path = ?) AND e.kind = 'IMPORTS_FROM' AND n.kind = 'File'
-                    UNION
-                    SELECT DISTINCT e.target_qualified, n.file_path FROM edges e
-                    JOIN nodes n ON n.file_path = e.target_qualified
-                    WHERE (e.source_qualified = ? OR e.file_path = ?) AND e.kind = 'IMPORTS_FROM' AND n.kind = 'File'
-                """, (curr_target, curr_target, curr_target, curr_target))
-                for row in cursor.fetchall():
-                    t_qual, t_file = row
-                    if t_qual and t_qual not in visited:
-                        visited.add(t_qual)
-                        queue.append((t_qual, hop + 1))
-                    if t_file and t_file not in visited:
-                        visited.add(t_file)
-                        queue.append((t_file, hop + 1))
-                    if t_file and t_file != filepath_abs:
-                        resolved_files.add(os.path.relpath(t_file, workspace_abs).replace("\\", "/"))
-            conn.close()
-        except Exception as e:
-            if is_debug_mode():
-                print(f"[DEBUG] [Chunker] SQLite fallback failed: {e}")
-    return resolved_files
+def get_symbol_neighbors_bfs(db_path: str, seed_symbols: list, max_hops: int = 1) -> set:
+    """
+    BFS outward from seed symbols up to max_hops edges. Returns newly
+    discovered symbols only (seeds excluded).
+    """
+    max_hops = max(1, int(max_hops or 1))
+    visited = set(seed_symbols)
+    frontier = set(seed_symbols)
+    discovered = set()
+    for _ in range(max_hops):
+        next_frontier = set()
+        for sym in frontier:
+            for neighbor in get_symbol_neighbors_local(db_path, sym):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    next_frontier.add(neighbor)
+                    discovered.add(neighbor)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return discovered
 
 def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: dict, dependency_graph: dict, max_hops: int = 1) -> str:
     config = get_config()
     token_budget = config.get("DEP_TOKEN_BUDGET", 5000)
+    
+    # Reconstruct the file's diff text safely to verify references
+    diff_text = " ".join(
+        list(parsed_diff.get("added_lines", {}).values()) + 
+        list(parsed_diff.get("context_lines", {}).values())
+    )
+    
+    # Find all symbols defined inside the file under review
+    local_symbols = [name for name, info in symbol_index.items() if info["file_path"] == filepath]
+    if not local_symbols:
+        return ""
+        
+    retrieved_symbols = set()
     bundle_lines = ["\n--- TRANSITIVE MODULE CONTEXT LOG ---"]
-    transitive_deps = get_recursive_dependencies(filepath, dependency_graph, max_hops=max_hops)
     accumulated_chars = sum(len(x) for x in bundle_lines)
     fallback_mode = False
     
-    for dep_file in transitive_deps:
-        # Exit the outer dependency-file loop immediately if the budget ceiling is breached
+    from app.llm_client import _context
+    db_path = os.path.join(os.path.abspath(_context.get("workspace") or "."), ".code-review-graph", "graph.db")
+    
+    # BFS lookup for neighbors up to max_hops
+    candidate_neighbors = get_symbol_neighbors_bfs(db_path, local_symbols, max_hops=max_hops)
+    
+    for neighbor_sym in candidate_neighbors:
         if (accumulated_chars / 4) >= token_budget:
             break
-        matching_symbols = [name for name, info in symbol_index.items() if info["file_path"] == dep_file]
-        for sym_name in matching_symbols:
-            # Exit the inner symbol loop immediately if the budget ceiling is breached
-            if (accumulated_chars / 4) >= token_budget:
-                break
-            meta = symbol_index[sym_name]
+            
+        if neighbor_sym in retrieved_symbols or neighbor_sym in local_symbols:
+            continue
+            
+        # Filter: only pull the symbol's body if it is referenced inside the diff text
+        simple_name = neighbor_sym.split("::")[-1]
+        if simple_name not in diff_text:
+            continue
+            
+        if neighbor_sym in symbol_index:
+            retrieved_symbols.add(neighbor_sym)
+            meta = symbol_index[neighbor_sym]
             line_range = meta.get("line_range", [1, 20])
-            content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=fallback_mode)
+            content = get_symbol_signature_or_content(meta["file_path"], line_range, fallback_only=fallback_mode)
             
             if (accumulated_chars + len(content)) / 4 > token_budget:
                 fallback_mode = True
-                content = get_symbol_signature_or_content(dep_file, line_range, fallback_only=True)
-                payload = f"\nDependency definition Signature for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
+                content = get_symbol_signature_or_content(meta["file_path"], line_range, fallback_only=True)
+                payload = f"\nDependency Signature '{neighbor_sym}' ({line_range[0]}-{line_range[1]}):\n{content}"
             else:
-                payload = f"\nDependency definition for '{sym_name}' (inside '{dep_file}' on lines {line_range[0]}-{line_range[1]}):\n{content}"
+                payload = f"\nDependency '{neighbor_sym}' ({line_range[0]}-{line_range[1]}):\n{content}"
             bundle_lines.append(payload)
             accumulated_chars += len(payload)
-            
+                
     if is_debug_mode():
         print(f"[DEBUG] [Chunker] Context compile complete. Size: {accumulated_chars} chars (~{int(accumulated_chars/4)} tokens).")
     return "\n".join(bundle_lines) if len(bundle_lines) > 1 else ""

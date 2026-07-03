@@ -1,10 +1,12 @@
+# ===== /root/code-review-agent/app/llm_client.py =====
 import os
 import time
 import threading
 import requests
 from google import genai
 from google.genai import types
-from app.config import get_secret, is_debug_mode
+from app.config import get_secret, is_debug_mode, get_config
+from app.profiler import PipelineProfiler
 
 _context = {
     "owner": "",
@@ -83,6 +85,8 @@ def get_lines(file: str, start: int, end: int) -> str:
 
     content_tokens = int(len(content) / 4)
     if _gatekeeper_ref:
+        profiler = PipelineProfiler()
+        start_gatekeeper_wait = time.perf_counter()
         while True:
             can_go, wait_time = _gatekeeper_ref.can_consume(content_tokens)
             if can_go:
@@ -91,6 +95,9 @@ def get_lines(file: str, start: int, end: int) -> str:
             if is_debug_mode():
                 print(f"[DEBUG] [get_lines Tool] Quota threshold near. Delaying tool content return. Pausing thread for {wait_time:.1f}s...")
             time.sleep(wait_time)
+        gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
+        if gatekeeper_wait_duration > 0.01:
+            profiler.record("Gatekeeper Wait: Tool API throttling", gatekeeper_wait_duration)
             
     return content
 
@@ -107,6 +114,7 @@ def reset_token_stats():
         token_stats["total_tokens"] = 0
 
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
+    profiler = PipelineProfiler()
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not defined. Run `python -m app.config --set-gemini` to configure it.")
@@ -137,7 +145,26 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         print(f"[Prompt Payload]\n{prompt}", flush=True)
         print("="*98 + "\n", flush=True)
         
+    # Standardize rate limit consumption check across all types of API requests (Pass 1, Pass 2, Symbols, Chunks, Routers)
+    prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
+    if _gatekeeper_ref:
+        start_gatekeeper_wait = time.perf_counter()
+        while True:
+            can_go, wait_time = _gatekeeper_ref.can_consume(prompt_tokens)
+            if can_go:
+                _gatekeeper_ref.record_call(prompt_tokens)
+                break
+            if is_debug_mode():
+                print(f"[DEBUG] [Gatekeeper] Throttling active. Pausing thread for {wait_time:.1f}s...")
+            time.sleep(wait_time)
+        gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
+        if gatekeeper_wait_duration > 0.01:
+            profiler.record("Gatekeeper Wait: RPM/TPM throttling", gatekeeper_wait_duration)
+            
     response = None
+    tid = threading.get_ident()
+    profiler.start("LLM API Call: Network Duration", thread_id=f"api_{tid}")
+    
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -161,7 +188,10 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
+                profiler.stop("LLM API Call: Network Duration", thread_id=f"api_{tid}")
                 raise e
+                
+    profiler.stop("LLM API Call: Network Duration", thread_id=f"api_{tid}")
     
     if not response or not response.text:
         raise RuntimeError("LLM returned an empty response.")

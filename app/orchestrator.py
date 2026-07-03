@@ -1,3 +1,4 @@
+# ===== /root/code-review-agent/app/orchestrator.py =====
 import json
 import os
 import re
@@ -7,7 +8,8 @@ from app.models import SubagentResponse, CodeComment
 from app.llm_client import call_gemini
 from app.prompt_builder import build_subagent_system_instruction
 from app.chunker import get_symbol_signature_or_content
-from app.config import is_debug_mode
+from app.config import get_config, is_debug_mode
+from app.profiler import PipelineProfiler
 
 STATIC_ANALYSIS_BASELINE = """
 This diff has ALREADY passed: ruff-format/ruff-lint, pyright, semgrep, gitleaks,
@@ -52,10 +54,44 @@ class SharedContextCache:
     def add(self, qual_name: str, metadata: dict, body: str):
         self.cache[qual_name] = {"metadata": metadata, "body": body}
 
+# --- Path Alignment Helpers ---
+
+def make_rel_path(path_str: str, workspace_dir: str) -> str:
+    """Normalizes an absolute path to a relative representation."""
+    if not path_str:
+        return ""
+    try:
+        rel = os.path.relpath(path_str, workspace_dir)
+        return rel.replace("\\", "/")
+    except ValueError:
+        return path_str.replace("\\", "/")
+
+def make_rel_qual_name(qual_name: str, workspace_dir: str) -> str:
+    """Converts absolute qualified names from SQLite nodes to relative strings."""
+    if "::" in qual_name:
+        parts = qual_name.split("::", 1)
+        rel_part = make_rel_path(parts[0], workspace_dir)
+        return f"{rel_part}::{parts[1]}"
+    else:
+        return make_rel_path(qual_name, workspace_dir)
+
+def make_abs_qual_name(qual_name: str, workspace_dir: str) -> str:
+    """Converts relative in-memory qualified names back to absolute for database indexing."""
+    if "::" in qual_name:
+        parts = qual_name.split("::", 1)
+        abs_part = os.path.abspath(os.path.join(workspace_dir, parts[0])).replace("\\", "/")
+        return f"{abs_part}::{parts[1]}"
+    else:
+        return os.path.abspath(os.path.join(workspace_dir, qual_name)).replace("\\", "/")
+
+# --- Database & Ast Index Queries ---
+
 def get_changed_symbols_in_file(db_path: str, filepath_abs: str, modified_lines: list) -> list:
     changed_symbols = []
     if not os.path.exists(db_path) or not modified_lines:
         return changed_symbols
+    
+    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -67,9 +103,11 @@ def get_changed_symbols_in_file(db_path: str, filepath_abs: str, modified_lines:
         for node in cursor.fetchall():
             l_start, l_end = node["line_start"] or 1, node["line_end"] or 1
             if any(l_start <= line <= l_end for line in modified_lines):
+                # Ensure the qualified name returned is relative to match symbol_index keys
+                rel_qual = make_rel_qual_name(node["qualified_name"], workspace_dir)
                 changed_symbols.append({
                     "name": node["name"],
-                    "qualified_name": node["qualified_name"],
+                    "qualified_name": rel_qual,
                     "line_range": [l_start, l_end],
                     "kind": node["kind"].lower()
                 })
@@ -79,30 +117,58 @@ def get_changed_symbols_in_file(db_path: str, filepath_abs: str, modified_lines:
             print(f"[DEBUG] [Orchestrator] Changed symbol matching failed: {e}")
     return changed_symbols
 
-def get_symbol_neighbors(db_path: str, qual_name: str) -> dict:
+def get_symbol_neighbors(db_path: str, qual_name: str, max_hops: int = 1) -> dict:
     neighbors = {"callers": [], "callees": [], "classes": []}
     if not os.path.exists(db_path):
         return neighbors
+    
+    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+    # Convert incoming relative qualified name to absolute to match SQLite contents
+    abs_qual_name = make_abs_qual_name(qual_name, workspace_dir)
+    max_hops = max(1, int(max_hops or 1))
+    
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')", (qual_name,))
-        neighbors["callees"] = [r[0] for r in cursor.fetchall() if r[0]]
-        cursor.execute("SELECT DISTINCT source_qualified FROM edges WHERE target_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')", (qual_name,))
-        neighbors["callers"] = [r[0] for r in cursor.fetchall() if r[0]]
-        cursor.execute("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind = 'IMPORTS_FROM'", (qual_name,))
-        neighbors["classes"] = [r[0] for r in cursor.fetchall() if r[0]]
+        
+        # Keep classes (IMPORTS_FROM) single-hop only
+        cursor.execute("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind = 'IMPORTS_FROM'", (abs_qual_name,))
+        neighbors["classes"] = [make_rel_qual_name(r[0], workspace_dir) for r in cursor.fetchall() if r[0]]
+        
+        # Traverse callers and callees (CALLS, DEPENDS_ON) up to max_hops via BFS
+        def bfs(direction_sql: str) -> set:
+            visited, frontier = {abs_qual_name}, {abs_qual_name}
+            for _ in range(max_hops):
+                nxt = set()
+                for sym in frontier:
+                    cursor.execute(direction_sql, (sym,))
+                    for r in cursor.fetchall():
+                        if r[0] and r[0] not in visited:
+                            visited.add(r[0])
+                            nxt.add(r[0])
+                if not nxt:
+                    break
+                frontier = nxt
+            visited.discard(abs_qual_name)
+            return visited
+            
+        callees = bfs("SELECT DISTINCT target_qualified FROM edges WHERE source_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')")
+        callers = bfs("SELECT DISTINCT source_qualified FROM edges WHERE target_qualified = ? AND kind IN ('CALLS', 'DEPENDS_ON')")
+        
+        neighbors["callees"] = [make_rel_qual_name(s, workspace_dir) for s in callees]
+        neighbors["callers"] = [make_rel_qual_name(s, workspace_dir) for s in callers]
+        
         conn.close()
     except Exception:
         pass
     return neighbors
 
-def populate_cache_for_symbol(db_path: str, qual_name: str, symbol_index: dict, cache: SharedContextCache):
+def populate_cache_for_symbol(db_path: str, qual_name: str, symbol_index: dict, cache: SharedContextCache, dep_hops: int = 1):
     if qual_name in symbol_index and not cache.contains(qual_name):
         meta = symbol_index[qual_name]
         body = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
         cache.add(qual_name, meta, body)
-    neighbors = get_symbol_neighbors(db_path, qual_name)
+    neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
     for caller in neighbors["callers"]:
         if caller in symbol_index and not cache.contains(caller):
             meta = symbol_index[caller]
@@ -138,7 +204,12 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     if is_debug_mode():
         print(f"[DEBUG] [Orchestrator] Spawning worker: '{role}'", flush=True)
     role_focus = SUBAGENT_PROMPTS.get(role, "")
-    role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, STATIC_ANALYSIS_BASELINE)
+    
+    # Dynamically verify if static baseline is enabled
+    config = get_config()
+    baseline = STATIC_ANALYSIS_BASELINE if config.get("ENABLE_STATIC_BASELINE", True) else ""
+    
+    role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     try:
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
@@ -198,57 +269,20 @@ def crg_search_symbols(db_path: str, query: str, limit: int = 10) -> list:
         pass
     return results
 
-def resolve_escalation(escalated_symbols: list, symbol_index: dict) -> str:
-    resolved_findings = []
-    vague_requests = []
-    if is_debug_mode():
-        print(f"[DEBUG] [Resolver] Resolving escalated symbols: {escalated_symbols}")
-    for sym in escalated_symbols:
-        if sym in symbol_index:
-            info = symbol_index[sym]
-            content = get_symbol_signature_or_content(info["file_path"], info["line_range"])
-            resolved_findings.append(f"--- Resolved Symbol Definition ({sym}) ---\n{content}")
-        else:
-            vague_requests.append(sym)
-    if vague_requests:
-        from app.llm_client import _context
-        workspace = _context.get("workspace") or "."
-        db_path = os.path.join(workspace, ".code-review-graph", "graph.db")
-        candidates = []
-        for v_req in vague_requests:
-            search_results = crg_search_symbols(db_path, v_req, limit=5)
-            for res in search_results:
-                rel_file = os.path.relpath(res["file_path"], workspace).replace("\\", "/")
-                qual_name = res["qualified_name"]
-                if "::" in qual_name:
-                    parts = qual_name.split("::", 1)
-                    try:
-                        rel_part = os.path.relpath(parts[0], workspace).replace("\\", "/")
-                        qual_name = f"{rel_part}::{parts[1]}"
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        qual_name = os.path.relpath(qual_name, workspace).replace("\\", "/")
-                    except Exception:
-                        pass
-                candidates.append(f"Symbol: {qual_name} | File: {rel_file} | Range: {res['line_range']}")
-        if candidates:
-            router_match = run_escalation_routing_llm(vague_requests, "\n".join(candidates[:10]))
-            resolved_findings.append(f"--- Router Resolved Candidates ---\n{router_match}")
-    return "\n\n".join(resolved_findings)
-
-def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventions_text: str, cache: SharedContextCache, db_path: str) -> list:
-    qual_name = changed_symbol["qualified_name"]
-    populate_cache_for_symbol(db_path, qual_name, symbol_index, cache)
-    neighbors = get_symbol_neighbors(db_path, qual_name)
-    symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
-    chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
-    
+def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_rounds: int = 1) -> list:
+    """
+    Consolidated multi-pass loop orchestrator. Loops dynamically through context escalations
+    and resolves symbol queries up to max_rounds [3].
+    """
+    profiler = PipelineProfiler()
     roles = ["Architecture", "Logic", "Security"]
+    
+    # Profile Pass 1 Parallel LLM calls
+    profiler.start("Orchestrator: Pass 1 Parallel LLM Reviews")
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
         results = {futures[f]: f.result() for f in futures}
+    profiler.stop("Orchestrator: Pass 1 Parallel LLM Reviews")
         
     escalated_symbols, escalated_roles, tracked_findings = [], [], {}
     for role, resp in results.items():
@@ -259,18 +293,30 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
             functions_req = list(req.functions)
             classes_req = list(req.classes)
             
-            # Deterministic natural-language fallback parser to recover missing items
+            # Enforce configuration key constraint if defined
+            config = get_config()
+            max_calls = config.get("MAX_ROUTER_CALLS_PER_CHUNK", 1)
+            
+            # Fallback natural language text extractor - refined to avoid noisy 4-letter word capture
             if not functions_req and not classes_req and req.why:
                 why_symbols = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", req.why)
-                why_symbols += re.findall(r"\b([a-z_][a-z0-9_]{3,})\b", req.why)
-                for w_sym in why_symbols:
-                    if w_sym not in ["functions", "classes", "why"]:
-                        functions_req.append(w_sym)
-            
+                candidate_words = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", req.why)
+                for w in candidate_words:
+                    if w.lower() not in ["functions", "classes", "why", "context", "symbol", "definition", "implementation"]:
+                        why_symbols.append(w)
+                
+                for w_sym in why_symbols[:max_calls]:
+                    functions_req.append(w_sym)
+                        
             escalated_roles.append(role)
             escalated_symbols.extend(functions_req + classes_req + req.configs)
 
-    if escalated_symbols and escalated_roles:
+    round_idx = 0
+    payload = chunk_payload
+    
+    # Dynamic multi-round escalation loop
+    while escalated_symbols and escalated_roles and round_idx < max_rounds:
+        profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         newly_retrieved_context = []
         for sym in escalated_symbols:
             if cache.contains(sym):
@@ -281,6 +327,7 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
                 cache.add(sym, meta, body)
                 newly_retrieved_context.append(f"--- Resolved Symbol Definition ({sym}) ---\n{body}")
             else:
+                # 1. Search the active HEAD database
                 search_results = crg_search_symbols(db_path, sym, limit=5)
                 exact_match = None
                 for res in search_results:
@@ -293,16 +340,60 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
                     body = get_symbol_signature_or_content(rel_file, target_node["line_range"], fallback_only=False)
                     cache.add(sym, {"file_path": rel_file, "line_range": target_node["line_range"]}, body)
                     newly_retrieved_context.append(f"--- Search Resolved Symbol Definition ({sym}) ---\n{body}")
+                else:
+                    # 2. Symbol is deleted from HEAD. Query the pre-change BASE database to check for dangling imports!
+                    from app.llm_client import _context
+                    base_sha = _context.get("base_sha")
+                    from app.repo_intelligence import INTEL_DIR
+                    base_db_path = os.path.join(INTEL_DIR, f"{base_sha}.db") if base_sha else ""
+                    
+                    base_callers = []
+                    if base_db_path and os.path.exists(base_db_path):
+                        try:
+                            conn = sqlite3.connect(base_db_path)
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                SELECT DISTINCT source_qualified FROM edges 
+                                WHERE (target_qualified = ? OR target_qualified LIKE ?) 
+                                  AND kind IN ('IMPORTS_FROM', 'CALLS', 'DEPENDS_ON')
+                            """, (sym, f"%::{sym}"))
+                            base_callers = [os.path.basename(r[0].split("::")[0]) for r in cursor.fetchall() if r[0]]
+                            conn.close()
+                        except Exception:
+                            pass
+                    
+                    if base_callers:
+                        clean_callers = list(set(base_callers))
+                        err_msg = f"Notice: Symbol '{sym}' was DELETED in this commit. Pre-change (BASE) commit caller graph analysis shows it was imported/referenced only by these files: {clean_callers}."
+                    else:
+                        err_msg = f"Notice: Symbol '{sym}' does not exist in the active HEAD commit and had no registered baseline callers."
+                        
+                    newly_retrieved_context.append(f"--- Symbol Deletion Notice ({sym}) ---\n{err_msg}")
 
         augmented = "\n\n".join(newly_retrieved_context)
-        retry_payload = f"{chunk_payload}\n\n--- Escalated Resolved Context (Pass 2) ---\n{augmented}"
+        payload = f"{payload}\n\n--- Escalated Resolved Context (Pass {round_idx + 2}) ---\n{augmented}"
+        profiler.stop(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
+        
+        # Profile subsequent escalation rounds
+        profiler.start(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        next_roles, next_symbols = [], []
         with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
-            retry_futures = {executor.submit(run_single_subagent, role, retry_payload, conventions_text): role for role in escalated_roles}
+            retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
             for rf in retry_futures:
                 role = retry_futures[rf]
                 resp = rf.result()
                 for f in resp.findings:
                     tracked_findings[(role, f.position)] = f
+                if resp.status == "NEEDS_CONTEXT" and resp.context_request:
+                    req = resp.context_request
+                    funcs, classes = list(req.functions), list(req.classes)
+                    if funcs or classes or req.configs:
+                        next_roles.append(role)
+                        next_symbols.extend(funcs + classes + req.configs)
+                        
+        profiler.stop(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        escalated_roles, escalated_symbols = next_roles, next_symbols
+        round_idx += 1
 
     final_comments = []
     for (role, position), f in tracked_findings.items():
@@ -313,20 +404,14 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
             ))
     return final_comments
 
-def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict) -> list:
-    roles = ["Architecture", "Logic", "Security"]
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
-        results = {futures[f]: f.result() for f in futures}
-    tracked_findings = {}
-    for role, resp in results.items():
-        for f in resp.findings:
-            tracked_findings[(role, f.position)] = f
-    final_comments = []
-    for (role, position), f in tracked_findings.items():
-        if f.comment and f.comment.strip():
-            final_comments.append(CodeComment(
-                file="", position=f.position, severity=f.severity, role=role,
-                comment=f.comment, confidence=f.confidence, references_specific_identifier=f.references_specific_identifier
-            ))
-    return final_comments
+def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventions_text: str, cache: SharedContextCache, db_path: str, dep_hops: int = 1, max_escalation_rounds: int = 1) -> list:
+    qual_name = changed_symbol["qualified_name"]
+    populate_cache_for_symbol(db_path, qual_name, symbol_index, cache, dep_hops=dep_hops)
+    neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
+    symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
+    chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
+    
+    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
+
+def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_escalation_rounds: int = 1) -> list:
+    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)

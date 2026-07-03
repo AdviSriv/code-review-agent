@@ -1,10 +1,9 @@
 certifi==2026.5.20
 charset-normalizer==3.4.7
 idna==3.18
-python-dotenv==1.2.2
-requests==2.34.2
+python-dotenv==1.2.1
 unidiff==0.7.5
-urllib3==2.7.0
+urllib3==2.6.3
 pydantic>=2.0.0
 google-genai>=1.0.0
-requests>=2.31.0
+requests>=2.32.5
