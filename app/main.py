@@ -34,6 +34,8 @@ from app.orchestrator import (
 )
 from app.validator import validate_and_deduplicate_comments
 from app.profiler import PipelineProfiler
+# New Semantic indexing module
+from app.semantic_index import sync_semantic_index
 
 gatekeeper = RateGatekeeper()
 
@@ -161,6 +163,25 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             "base_sha": base_sha
         })
         llm_client._gatekeeper_ref = gatekeeper
+
+        # --- 1. Cheap Triage Gates First ---
+        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
+        
+        if evaluate_docs_only_skip(changed_file_paths):
+            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+            
+        profiler.start("Triage validation: Local Compilers & Linters")
+        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
+        profiler.stop("Triage validation: Local Compilers & Linters")
+        
+        if not compile_status["passed"]:
+            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+
+        # --- 2. Expensive AST and Semantic Indexing only if triage passes ---
         
         # Fetch / build the HEAD commit index
         profiler.start("RepoIntel Build: Head Commit AST Index")
@@ -170,6 +191,9 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             build_repo_intelligence(workspace_path, commit_id)
             intel_data = load_repo_intelligence(commit_id)
         profiler.stop("RepoIntel Build: Head Commit AST Index")
+
+        symbol_index = intel_data.get("symbol_index", {})
+        dependency_graph = intel_data.get("dependency_graph", {})
             
         # Also ensure base_sha database is indexed so we can query base callers during deletion escalations
         profiler.start("RepoIntel Build: Base Commit AST Index")
@@ -180,26 +204,14 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             build_repo_intelligence(workspace_path, base_sha)
             ensure_local_checkout(owner, repo, commit_id, token)
         profiler.stop("RepoIntel Build: Base Commit AST Index")
-            
-        symbol_index = intel_data.get("symbol_index", {})
-        dependency_graph = intel_data.get("dependency_graph", {})
-        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
+
+        # Build or synchronize the Semantic Vector Database in parallel
+        profiler.start("RepoIntel Build: Semantic Qdrant Sync")
+        # Convert absolute paths in changed_file_paths to relative paths
+        rel_changed_files = [os.path.relpath(f, workspace_path).replace("\\", "/") for f in changed_file_paths]
+        sync_semantic_index(owner, repo, commit_id, symbol_index, dependency_graph, rel_changed_files)
+        profiler.stop("RepoIntel Build: Semantic Qdrant Sync")
         
-        if evaluate_docs_only_skip(changed_file_paths):
-            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
-            profiler.stop("Pipeline: Full Process Execution")
-            return
-            
-        # Profile compilation step using explicit thread-safe cwd pathways (no os.chdir)
-        profiler.start("Triage validation: Local Compilers & Linters")
-        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
-        profiler.stop("Triage validation: Local Compilers & Linters")
-        
-        if not compile_status["passed"]:
-            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
-            profiler.stop("Pipeline: Full Process Execution")
-            return
-            
         conventions = get_repo_conventions(owner, repo, token)
         db_path = os.path.join(workspace_path, ".code-review-graph", "graph.db")
         

@@ -1,4 +1,3 @@
-# ===== /root/code-review-agent/app/llm_client.py =====
 import os
 import time
 import threading
@@ -83,6 +82,9 @@ def get_lines(file: str, start: int, end: int) -> str:
     if not content:
         return f"Error: File '{file}' not found locally or remote parameters missing."
 
+    if get_config().get("LLM_BACKEND") == "ollama":
+        return content
+
     content_tokens = int(len(content) / 4)
     if _gatekeeper_ref:
         profiler = PipelineProfiler()
@@ -113,6 +115,74 @@ def reset_token_stats():
         token_stats["candidates_tokens"] = 0
         token_stats["total_tokens"] = 0
 
+def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str:
+    """Invokes local Ollama server chat API with structured format support and retry safety."""
+    profiler = PipelineProfiler()
+    config = get_config()
+    ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
+    model = os.getenv("LLM_MODEL", "qwen2.5-coder:14b")
+    
+    url = f"{ollama_host}/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt}
+        ],
+        "options": {
+            "temperature": 0.1
+        },
+        "stream": False
+    }
+    
+    if response_schema is not None:
+        payload["format"] = response_schema.model_json_schema()
+
+    if is_debug_mode():
+        print("\n" + "="*40 + " OLLAMA LOCAL PROMPT " + "="*40, flush=True)
+        print(f"[System Instruction]\n{system_instruction}\n", flush=True)
+        print(f"[Prompt Payload]\n{prompt}", flush=True)
+        print("="*98 + "\n", flush=True)
+
+    max_retries = 3
+    retry_delay = 3
+    response_data = None
+    tid = threading.get_ident()
+    profiler.start("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
+    
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=payload, timeout=120)
+            if r.status_code != 200:
+                raise RuntimeError(f"Ollama returned status code {r.status_code}: {r.text}")
+            response_data = r.json()
+            break
+        except Exception as e:
+            error_str = str(e)
+            if attempt < max_retries - 1:
+                print(f"[Local LLM Client] Connection error on attempt {attempt+1}. Retrying in {retry_delay} seconds... Error: {error_str.splitlines()[0]}")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
+                raise e
+
+    profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
+    
+    content = response_data.get("message", {}).get("content", "")
+    
+    prompt_tokens = response_data.get("prompt_eval_count", 0)
+    candidates_tokens = response_data.get("eval_count", 0)
+    
+    with _lock:
+        token_stats["prompt_tokens"] += prompt_tokens
+        token_stats["candidates_tokens"] += candidates_tokens
+        token_stats["total_tokens"] += (prompt_tokens + candidates_tokens)
+        if is_debug_mode():
+            print(f"[DEBUG] [Local LLM Client] Call finished. Tokens used in turn: {prompt_tokens + candidates_tokens}", flush=True)
+            
+    return content
+
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     profiler = PipelineProfiler()
     api_key = get_secret("GEMINI_API_KEY")
@@ -130,8 +200,6 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     if response_schema is not None:
         config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["response_schema"] = response_schema
-    else:
-        config_kwargs["tools"] = [get_lines]
         
     config = types.GenerateContentConfig(**config_kwargs)
     
@@ -145,21 +213,25 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         print(f"[Prompt Payload]\n{prompt}", flush=True)
         print("="*98 + "\n", flush=True)
         
-    # Standardize rate limit consumption check across all types of API requests (Pass 1, Pass 2, Symbols, Chunks, Routers)
-    prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
-    if _gatekeeper_ref:
-        start_gatekeeper_wait = time.perf_counter()
-        while True:
-            can_go, wait_time = _gatekeeper_ref.can_consume(prompt_tokens)
-            if can_go:
-                _gatekeeper_ref.record_call(prompt_tokens)
-                break
-            if is_debug_mode():
-                print(f"[DEBUG] [Gatekeeper] Throttling active. Pausing thread for {wait_time:.1f}s...")
-            time.sleep(wait_time)
-        gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
-        if gatekeeper_wait_duration > 0.01:
-            profiler.record("Gatekeeper Wait: RPM/TPM throttling", gatekeeper_wait_duration)
+    # Rate gating is not checked if executing local tasks
+    if get_config().get("LLM_BACKEND") == "ollama":
+        pass
+    else:
+        # Standardize rate limit consumption check across all types of API requests
+        prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
+        if _gatekeeper_ref:
+            start_gatekeeper_wait = time.perf_counter()
+            while True:
+                can_go, wait_time = _gatekeeper_ref.can_consume(prompt_tokens)
+                if can_go:
+                    _gatekeeper_ref.record_call(prompt_tokens)
+                    break
+                if is_debug_mode():
+                    print(f"[DEBUG] [Gatekeeper] Throttling active. Pausing thread for {wait_time:.1f}s...")
+                time.sleep(wait_time)
+            gatekeeper_wait_duration = time.perf_counter() - start_gatekeeper_wait
+            if gatekeeper_wait_duration > 0.01:
+                profiler.record("Gatekeeper Wait: RPM/TPM throttling", gatekeeper_wait_duration)
             
     response = None
     tid = threading.get_ident()

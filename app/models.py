@@ -20,6 +20,7 @@ class ContextRequest(BaseModel):
     classes: List[str] = Field(default_factory=list, description="Exact names of classes you need to inspect.")
     configs: List[str] = Field(default_factory=list, description="Global configuration variables or settings needed.")
     why: str = Field(..., description="Brief explanation of why this context is required.")
+    semantic_queries: Optional[List[str]] = Field(default_factory=list, description="Vague concepts or descriptions to query in the vector database.")
 
 class SubagentFinding(BaseModel):
     position: int = Field(..., description="1-based diff position of the line needing feedback.")

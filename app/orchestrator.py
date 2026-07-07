@@ -1,11 +1,10 @@
-# ===== /root/code-review-agent/app/orchestrator.py =====
 import json
 import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from app.models import SubagentResponse, CodeComment
-from app.llm_client import call_gemini
+from app.llm_client import call_gemini, call_local_llm
 from app.prompt_builder import build_subagent_system_instruction
 from app.chunker import get_symbol_signature_or_content
 from app.config import get_config, is_debug_mode
@@ -200,6 +199,40 @@ def compile_symbol_bundle(qual_name: str, cache: SharedContextCache, neighbors: 
             lines.append(f"\nRelated Class interface '{cls}':\n{cache.get_body(cls)}")
     return "\n".join(lines)
 
+def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: SharedContextCache) -> str:
+    """
+    Executes a proactive semantic search seeded from the query text.
+    Injects matches directly into the cache and prompt to resolve 'unknown unknowns'.
+    """
+    from app.llm_client import _context
+    owner = _context.get("owner")
+    repo = _context.get("repo")
+    if not (owner and repo and symbol_index):
+        return ""
+        
+    collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_")
+    try:
+        from app.semantic_index import search_semantic
+        matches = search_semantic(query_text, collection_name, limit=3)
+        semantic_lines = []
+        
+        for match in matches:
+            payload_data = match.get("payload", {})
+            m_qual = payload_data.get("symbol")
+            if m_qual and m_qual in symbol_index:
+                m_meta = symbol_index[m_qual]
+                if not cache.contains(m_qual):
+                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
+                    cache.add(m_qual, m_meta, m_body)
+                semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
+                
+        if semantic_lines:
+            return "\n--- PROACTIVE SEMANTIC DISCOVERIES ---\n" + "\n".join(semantic_lines)
+    except Exception as e:
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Proactive semantic lookups bypassed: {e}")
+    return ""
+
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
     if is_debug_mode():
         print(f"[DEBUG] [Orchestrator] Spawning worker: '{role}'", flush=True)
@@ -211,33 +244,39 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     
     role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
-    try:
+    
+    # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes [3]
+    backend = config.get("LLM_BACKEND", "gemini")
+    if backend == "ollama":
+        raw_out = call_local_llm(prompt, role_instruction, SubagentResponse)
+    else:
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
-        cleaned = raw_out.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
         
-        resp = SubagentResponse(**json.loads(cleaned.strip()))
+    cleaned = raw_out.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    
+    resp = SubagentResponse(**json.loads(cleaned.strip()))
+    
+    if is_debug_mode():
+        print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
+        print(raw_out, flush=True)
+        print("-"*98 + "\n", flush=True)
+        print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
         
-        if is_debug_mode():
-            print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
-            print(raw_out, flush=True)
-            print("-"*98 + "\n", flush=True)
-            print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-            
-        return resp
-    except Exception as e:
-        print(f"Subagent {role} failed: {e}", flush=True)
-        return SubagentResponse(status="SUCCESS", findings=[])
+    return resp
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
     system_inst = "You are a code symbol mapping router. Match requested vague expressions to exact symbol paths."
     prompt = f"Symbols requested: {escalated_symbols}\nCandidates list:\n{index_candidates}\nIdentify and return exact match candidates as a simple list."
     try:
+        config = get_config()
+        if config.get("LLM_BACKEND") == "ollama":
+            return call_local_llm(prompt, system_inst, None)
         return call_gemini(prompt, system_inst, None)
     except Exception:
         return ""
@@ -271,20 +310,31 @@ def crg_search_symbols(db_path: str, query: str, limit: int = 10) -> list:
 
 def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_rounds: int = 1) -> list:
     """
-    Consolidated multi-pass loop orchestrator. Loops dynamically through context escalations
-    and resolves symbol queries up to max_rounds [3].
+    Consolidated multi-pass loop orchestrator. Loops dynamically through context escalations,
+    resolving symbol and semantic query requests up to max_rounds [3].
     """
     profiler = PipelineProfiler()
     roles = ["Architecture", "Logic", "Security"]
     
-    # Profile Pass 1 Parallel LLM calls
-    profiler.start("Orchestrator: Pass 1 Parallel LLM Reviews")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
-        results = {futures[f]: f.result() for f in futures}
-    profiler.stop("Orchestrator: Pass 1 Parallel LLM Reviews")
+    # Parity parallelization logic to protect Ollama CPU limits [3]
+    backend = get_config().get("LLM_BACKEND", "gemini")
+    
+    profiler.start("Orchestrator: Pass 1 LLM Reviews")
+    if backend == "ollama":
+        # Sequential execution on local backends to prevent thread thrashing
+        results = {}
+        for role in roles:
+            results[role] = run_single_subagent(role, chunk_payload, conventions_text)
+    else:
+        # Multi-threaded parallel execution for Cloud API endpoints
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
+            results = {futures[f]: f.result() for f in futures}
+    profiler.stop("Orchestrator: Pass 1 LLM Reviews")
         
     escalated_symbols, escalated_roles, tracked_findings = [], [], {}
+    semantic_queries_map = {}
+
     for role, resp in results.items():
         for f in resp.findings:
             tracked_findings[(role, f.position)] = f
@@ -293,12 +343,14 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
             functions_req = list(req.functions)
             classes_req = list(req.classes)
             
-            # Enforce configuration key constraint if defined
             config = get_config()
             max_calls = config.get("MAX_ROUTER_CALLS_PER_CHUNK", 1)
             
-            # Fallback natural language text extractor - refined to avoid noisy 4-letter word capture
-            if not functions_req and not classes_req and req.why:
+            subagent_queries = getattr(req, "semantic_queries", []) or []
+            if subagent_queries:
+                semantic_queries_map.setdefault(role, []).extend(subagent_queries)
+
+            if not functions_req and not classes_req and not subagent_queries and req.why:
                 why_symbols = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", req.why)
                 candidate_words = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", req.why)
                 for w in candidate_words:
@@ -308,16 +360,39 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                 for w_sym in why_symbols[:max_calls]:
                     functions_req.append(w_sym)
                         
-            escalated_roles.append(role)
-            escalated_symbols.extend(functions_req + classes_req + req.configs)
+            if functions_req or classes_req or req.configs or subagent_queries:
+                escalated_roles.append(role)
+                escalated_symbols.extend(functions_req + classes_req + req.configs)
 
     round_idx = 0
     payload = chunk_payload
     
+    from app.llm_client import _context
+    owner = _context.get("owner")
+    repo = _context.get("repo")
+    collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_") if (owner and repo) else ""
+
     # Dynamic multi-round escalation loop
-    while escalated_symbols and escalated_roles and round_idx < max_rounds:
+    while (escalated_symbols or semantic_queries_map) and escalated_roles and round_idx < max_rounds:
         profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         newly_retrieved_context = []
+
+        if semantic_queries_map:
+            from app.semantic_index import search_semantic
+            for role, queries in list(semantic_queries_map.items()):
+                for query in queries[:3]:
+                    matches = search_semantic(query, collection_name, limit=3)
+                    for match in matches:
+                        meta_payload = match.get("payload", {})
+                        m_qual = meta_payload.get("symbol")
+                        if m_qual and m_qual in symbol_index:
+                            m_meta = symbol_index[m_qual]
+                            if not cache.contains(m_qual):
+                                m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
+                                cache.add(m_qual, m_meta, m_body)
+                            newly_retrieved_context.append(f"--- Semantic Vector Search Match ({m_qual}) ---\n{cache.get_body(m_qual)}")
+            semantic_queries_map.clear()
+
         for sym in escalated_symbols:
             if cache.contains(sym):
                 newly_retrieved_context.append(f"--- Cached Symbol Definition ({sym}) ---\n{cache.get_body(sym)}")
@@ -327,7 +402,6 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                 cache.add(sym, meta, body)
                 newly_retrieved_context.append(f"--- Resolved Symbol Definition ({sym}) ---\n{body}")
             else:
-                # 1. Search the active HEAD database
                 search_results = crg_search_symbols(db_path, sym, limit=5)
                 exact_match = None
                 for res in search_results:
@@ -341,8 +415,6 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                     cache.add(sym, {"file_path": rel_file, "line_range": target_node["line_range"]}, body)
                     newly_retrieved_context.append(f"--- Search Resolved Symbol Definition ({sym}) ---\n{body}")
                 else:
-                    # 2. Symbol is deleted from HEAD. Query the pre-change BASE database to check for dangling imports!
-                    from app.llm_client import _context
                     base_sha = _context.get("base_sha")
                     from app.repo_intelligence import INTEL_DIR
                     base_db_path = os.path.join(INTEL_DIR, f"{base_sha}.db") if base_sha else ""
@@ -374,24 +446,44 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
         payload = f"{payload}\n\n--- Escalated Resolved Context (Pass {round_idx + 2}) ---\n{augmented}"
         profiler.stop(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         
-        # Profile subsequent escalation rounds
-        profiler.start(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        profiler.start(f"Orchestrator: Pass {round_idx + 2} LLM Reviews")
         next_roles, next_symbols = [], []
-        with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
-            retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
-            for rf in retry_futures:
-                role = retry_futures[rf]
-                resp = rf.result()
+        
+        if backend == "ollama":
+            # Sequential re-evaluation
+            for role in escalated_roles:
+                resp = run_single_subagent(role, payload, conventions_text)
                 for f in resp.findings:
                     tracked_findings[(role, f.position)] = f
                 if resp.status == "NEEDS_CONTEXT" and resp.context_request:
                     req = resp.context_request
                     funcs, classes = list(req.functions), list(req.classes)
-                    if funcs or classes or req.configs:
+                    sub_q = getattr(req, "semantic_queries", []) or []
+                    if sub_q:
+                        semantic_queries_map.setdefault(role, []).extend(sub_q)
+                    if funcs or classes or req.configs or sub_q:
                         next_roles.append(role)
                         next_symbols.extend(funcs + classes + req.configs)
+        else:
+            # Parallel re-evaluation
+            with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
+                retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
+                for rf in retry_futures:
+                    role = retry_futures[rf]
+                    resp = rf.result()
+                    for f in resp.findings:
+                        tracked_findings[(role, f.position)] = f
+                    if resp.status == "NEEDS_CONTEXT" and resp.context_request:
+                        req = resp.context_request
+                        funcs, classes = list(req.functions), list(req.classes)
+                        sub_q = getattr(req, "semantic_queries", []) or []
+                        if sub_q:
+                            semantic_queries_map.setdefault(role, []).extend(sub_q)
+                        if funcs or classes or req.configs or sub_q:
+                            next_roles.append(role)
+                            next_symbols.extend(funcs + classes + req.configs)
                         
-        profiler.stop(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        profiler.stop(f"Orchestrator: Pass {round_idx + 2} LLM Reviews")
         escalated_roles, escalated_symbols = next_roles, next_symbols
         round_idx += 1
 
@@ -409,9 +501,24 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
     populate_cache_for_symbol(db_path, qual_name, symbol_index, cache, dep_hops=dep_hops)
     neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
     symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
+    
+    # ─── Proactive Semantic Context Pass ───
+    proactive_context = ""
+    changed_code = cache.get_body(qual_name)
+    if changed_code:
+        proactive_context = get_proactive_semantic_context(changed_code, symbol_index, cache)
+        
     chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
+    if proactive_context:
+        chunk_payload = f"{chunk_payload}\n{proactive_context}"
     
     return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
 
 def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_escalation_rounds: int = 1) -> list:
-    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
+    # ─── Proactive Semantic Context Pass ───
+    proactive_context = get_proactive_semantic_context(chunk_payload, symbol_index, cache)
+    payload = chunk_payload
+    if proactive_context:
+        payload = f"{chunk_payload}\n{proactive_context}"
+        
+    return run_escalation_rounds(payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)

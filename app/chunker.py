@@ -1,12 +1,21 @@
-# ===== /root/code-review-agent/app/chunker.py =====
 import os
 import requests
 from app.config import get_config, is_debug_mode
 
 def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
-    if os.path.exists(filepath):
+    """
+    Fetches the signature or source segment of a symbol. Resolves relative paths
+    against the checked out workspace directory to prevent falling back to GitHub API.
+    """
+    from app.llm_client import _context
+    workspace = _context.get("workspace")
+    
+    # Resolve relative paths against the checked out workspace directory
+    local_path = os.path.join(workspace, filepath) if (workspace and not os.path.isabs(filepath)) else filepath
+    
+    if os.path.exists(local_path):
         try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
             start = max(0, line_range[0] - 1)
             end = min(len(lines), line_range[1])
@@ -17,7 +26,7 @@ def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_on
         except Exception:
             pass
             
-    from app.llm_client import _context
+    # Fallback to remote API only if local checkout file is missing
     owner, repo, token, ref = _context.get("owner"), _context.get("repo"), _context.get("token"), _context.get("commit_sha")
     if owner and repo and token and ref:
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"

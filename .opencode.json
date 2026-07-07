@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "/root/code-review-agent/.venv/bin/python",
+      "args": [
+        "-m",
+        "code_review_graph",
+        "serve"
+      ],
+      "cwd": "/root/code-review-agent",
+      "type": "stdio",
+      "env": []
+    }
+  }
+}
