@@ -199,10 +199,11 @@ def compile_symbol_bundle(qual_name: str, cache: SharedContextCache, neighbors: 
             lines.append(f"\nRelated Class interface '{cls}':\n{cache.get_body(cls)}")
     return "\n".join(lines)
 
-def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: SharedContextCache) -> str:
+def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: SharedContextCache, db_path: str, limit: int = 5) -> str:
     """
-    Executes a proactive semantic search seeded from the query text.
-    Injects matches directly into the cache and prompt to resolve 'unknown unknowns'.
+    Executes an automatic (Stage 1) proactive semantic search seeded from the query/diff text.
+    Applies a 1-hop Graph Expansion (callers and callees) on the semantically discovered matches.
+    Injects the matches and expanded neighbor signatures directly into the cache.
     """
     from app.llm_client import _context
     owner = _context.get("owner")
@@ -213,7 +214,9 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
     collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_")
     try:
         from app.semantic_index import search_semantic
-        matches = search_semantic(query_text, collection_name, limit=3)
+        # Safety Truncation: Prevents massive diff payloads from exceeding model embedding context limits
+        truncated_query = query_text[:8000]
+        matches = search_semantic(truncated_query, collection_name, limit=limit)
         semantic_lines = []
         
         for match in matches:
@@ -224,10 +227,27 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
                 if not cache.contains(m_qual):
                     m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
                     cache.add(m_qual, m_meta, m_body)
+                
                 semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
                 
+                # 1-hop Graph Expansion on the semantic match to surface structural relevance
+                neighbors = get_symbol_neighbors(db_path, m_qual, max_hops=1)
+                for caller in neighbors["callers"][:2]:  # Limit to avoid bloating token budget
+                    if caller in symbol_index and not cache.contains(caller):
+                        n_meta = symbol_index[caller]
+                        n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
+                        cache.add(caller, n_meta, n_body)
+                        semantic_lines.append(f"  └─ Caller of match '{caller}': {n_body}")
+                        
+                for callee in neighbors["callees"][:2]:  # Limit to avoid bloating token budget
+                    if callee in symbol_index and not cache.contains(callee):
+                        n_meta = symbol_index[callee]
+                        n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
+                        cache.add(callee, n_meta, n_body)
+                        semantic_lines.append(f"  └─ Callee of match '{callee}': {n_body}")
+                
         if semantic_lines:
-            return "\n--- PROACTIVE SEMANTIC DISCOVERIES ---\n" + "\n".join(semantic_lines)
+            return "\n--- PROACTIVE SEMANTIC DISCOVERIES & EXPANDED GRAPH CONTEXT ---\n" + "\n".join(semantic_lines)
     except Exception as e:
         if is_debug_mode():
             print(f"[DEBUG] [Orchestrator] Proactive semantic lookups bypassed: {e}")
@@ -245,7 +265,7 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
     
-    # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes [3]
+    # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes
     backend = config.get("LLM_BACKEND", "gemini")
     if backend == "ollama":
         raw_out = call_local_llm(prompt, role_instruction, SubagentResponse)
@@ -372,7 +392,7 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
     repo = _context.get("repo")
     collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_") if (owner and repo) else ""
 
-    # Dynamic multi-round escalation loop
+    # Dynamic multi-round escalation loop (Stage 2)
     while (escalated_symbols or semantic_queries_map) and escalated_roles and round_idx < max_rounds:
         profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         newly_retrieved_context = []
@@ -502,11 +522,11 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
     neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
     symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
     
-    # ─── Proactive Semantic Context Pass ───
+    # ─── Stage 1: Automatic Proactive Semantic Context & Graph Expansion Pass ───
     proactive_context = ""
     changed_code = cache.get_body(qual_name)
     if changed_code:
-        proactive_context = get_proactive_semantic_context(changed_code, symbol_index, cache)
+        proactive_context = get_proactive_semantic_context(changed_code, symbol_index, cache, db_path, limit=5)
         
     chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
     if proactive_context:
@@ -515,8 +535,8 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
     return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
 
 def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_escalation_rounds: int = 1) -> list:
-    # ─── Proactive Semantic Context Pass ───
-    proactive_context = get_proactive_semantic_context(chunk_payload, symbol_index, cache)
+    # ─── Stage 1: Automatic Proactive Semantic Context & Graph Expansion Pass ───
+    proactive_context = get_proactive_semantic_context(chunk_payload, symbol_index, cache, db_path, limit=5)
     payload = chunk_payload
     if proactive_context:
         payload = f"{chunk_payload}\n{proactive_context}"

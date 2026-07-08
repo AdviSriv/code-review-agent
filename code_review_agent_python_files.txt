@@ -1,13 +1,22 @@
-===== /root/code-review-agent/app/chunker.py =====
-# ===== /root/code-review-agent/app/chunker.py =====
+===== ./app/chunker.py =====
 import os
 import requests
 from app.config import get_config, is_debug_mode
 
 def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_only: bool = False) -> str:
-    if os.path.exists(filepath):
+    """
+    Fetches the signature or source segment of a symbol. Resolves relative paths
+    against the checked out workspace directory to prevent falling back to GitHub API.
+    """
+    from app.llm_client import _context
+    workspace = _context.get("workspace")
+    
+    # Resolve relative paths against the checked out workspace directory
+    local_path = os.path.join(workspace, filepath) if (workspace and not os.path.isabs(filepath)) else filepath
+    
+    if os.path.exists(local_path):
         try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
             start = max(0, line_range[0] - 1)
             end = min(len(lines), line_range[1])
@@ -18,7 +27,7 @@ def get_symbol_signature_or_content(filepath: str, line_range: list, fallback_on
         except Exception:
             pass
             
-    from app.llm_client import _context
+    # Fallback to remote API only if local checkout file is missing
     owner, repo, token, ref = _context.get("owner"), _context.get("repo"), _context.get("token"), _context.get("commit_sha")
     if owner and repo and token and ref:
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
@@ -139,7 +148,8 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
     if is_debug_mode():
         print(f"[DEBUG] [Chunker] Context compile complete. Size: {accumulated_chars} chars (~{int(accumulated_chars/4)} tokens).")
     return "\n".join(bundle_lines) if len(bundle_lines) > 1 else ""
-===== /root/code-review-agent/app/config.py =====
+
+===== ./app/config.py =====
 import os
 import json
 import argparse
@@ -257,7 +267,7 @@ if __name__ == "__main__":
     if updates:
         save_config(updates)
 
-===== /root/code-review-agent/app/diff_parser.py =====
+===== ./app/diff_parser.py =====
 import os
 
 IGNORED_EXTENSIONS = {
@@ -435,7 +445,7 @@ def parse_full_diff(diff_text: str) -> dict:
         files[current_file] = parse_patch("\n".join(patch_lines))
         
     return files
-===== /root/code-review-agent/app/gatekeeper.py =====
+===== ./app/gatekeeper.py =====
 import time
 import threading
 from app.config import get_config
@@ -485,7 +495,7 @@ class RateGatekeeper:
             self.update_window()
             self.call_history.append((time.time(), tokens_used))
             self.daily_count += 1
-===== /root/code-review-agent/app/llm_client.py =====
+===== ./app/llm_client.py =====
 import os
 import time
 import threading
@@ -604,7 +614,7 @@ def reset_token_stats():
         token_stats["total_tokens"] = 0
 
 def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str:
-    """Invokes local Ollama server chat API with structured format support."""
+    """Invokes local Ollama server chat API with structured format support and retry safety."""
     profiler = PipelineProfiler()
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
@@ -620,7 +630,7 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
         "options": {
             "temperature": 0.1
         },
-        "stream": false
+        "stream": False
     }
     
     if response_schema is not None:
@@ -632,33 +642,44 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
         print(f"[Prompt Payload]\n{prompt}", flush=True)
         print("="*98 + "\n", flush=True)
 
+    max_retries = 3
+    retry_delay = 3
+    response_data = None
     tid = threading.get_ident()
     profiler.start("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
     
-    try:
-        r = requests.post(url, json=payload, timeout=120)
-        profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
-        
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama returned status code {r.status_code}: {r.text}")
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=payload, timeout=120)
+            if r.status_code != 200:
+                raise RuntimeError(f"Ollama returned status code {r.status_code}: {r.text}")
+            response_data = r.json()
+            break
+        except Exception as e:
+            error_str = str(e)
+            if attempt < max_retries - 1:
+                print(f"[Local LLM Client] Connection error on attempt {attempt+1}. Retrying in {retry_delay} seconds... Error: {error_str.splitlines()[0]}")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
+                raise e
+
+    profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
+    
+    content = response_data.get("message", {}).get("content", "")
+    
+    prompt_tokens = response_data.get("prompt_eval_count", 0)
+    candidates_tokens = response_data.get("eval_count", 0)
+    
+    with _lock:
+        token_stats["prompt_tokens"] += prompt_tokens
+        token_stats["candidates_tokens"] += candidates_tokens
+        token_stats["total_tokens"] += (prompt_tokens + candidates_tokens)
+        if is_debug_mode():
+            print(f"[DEBUG] [Local LLM Client] Call finished. Tokens used in turn: {prompt_tokens + candidates_tokens}", flush=True)
             
-        res_data = r.json()
-        content = res_data.get("message", {}).get("content", "")
-        
-        prompt_tokens = res_data.get("prompt_eval_count", 0)
-        candidates_tokens = res_data.get("eval_count", 0)
-        
-        with _lock:
-            token_stats["prompt_tokens"] += prompt_tokens
-            token_stats["candidates_tokens"] += candidates_tokens
-            token_stats["total_tokens"] += (prompt_tokens + candidates_tokens)
-            if is_debug_mode():
-                print(f"[DEBUG] [Local LLM Client] Call finished. Tokens used in turn: {prompt_tokens + candidates_tokens}", flush=True)
-                
-        return content
-    except Exception as e:
-        profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
-        raise e
+    return content
 
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     profiler = PipelineProfiler()
@@ -677,8 +698,6 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
     if response_schema is not None:
         config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["response_schema"] = response_schema
-    else:
-        config_kwargs["tools"] = [get_lines]
         
     config = types.GenerateContentConfig(**config_kwargs)
     
@@ -758,7 +777,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         
     return response.text
 
-===== /root/code-review-agent/app/main.py =====
+===== ./app/main.py =====
 # ===== /root/code-review-agent/app/main.py =====
 import os
 import sys
@@ -924,6 +943,25 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             "base_sha": base_sha
         })
         llm_client._gatekeeper_ref = gatekeeper
+
+        # --- 1. Cheap Triage Gates First ---
+        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
+        
+        if evaluate_docs_only_skip(changed_file_paths):
+            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+            
+        profiler.start("Triage validation: Local Compilers & Linters")
+        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
+        profiler.stop("Triage validation: Local Compilers & Linters")
+        
+        if not compile_status["passed"]:
+            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
+            profiler.stop("Pipeline: Full Process Execution")
+            return
+
+        # --- 2. Expensive AST and Semantic Indexing only if triage passes ---
         
         # Fetch / build the HEAD commit index
         profiler.start("RepoIntel Build: Head Commit AST Index")
@@ -936,11 +974,6 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
 
         symbol_index = intel_data.get("symbol_index", {})
         dependency_graph = intel_data.get("dependency_graph", {})
-
-        # Build or synchronize the Semantic Vector Database in parallel
-        profiler.start("RepoIntel Build: Semantic Qdrant Sync")
-        sync_semantic_index(owner, repo, commit_id, symbol_index)
-        profiler.stop("RepoIntel Build: Semantic Qdrant Sync")
             
         # Also ensure base_sha database is indexed so we can query base callers during deletion escalations
         profiler.start("RepoIntel Build: Base Commit AST Index")
@@ -951,24 +984,14 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             build_repo_intelligence(workspace_path, base_sha)
             ensure_local_checkout(owner, repo, commit_id, token)
         profiler.stop("RepoIntel Build: Base Commit AST Index")
-            
-        changed_file_paths = [os.path.join(workspace_path, f.get("filename")) for f in pr_files]
+
+        # Build or synchronize the Semantic Vector Database in parallel
+        profiler.start("RepoIntel Build: Semantic Qdrant Sync")
+        # Convert absolute paths in changed_file_paths to relative paths
+        rel_changed_files = [os.path.relpath(f, workspace_path).replace("\\", "/") for f in changed_file_paths]
+        sync_semantic_index(owner, repo, commit_id, symbol_index, dependency_graph, rel_changed_files)
+        profiler.stop("RepoIntel Build: Semantic Qdrant Sync")
         
-        if evaluate_docs_only_skip(changed_file_paths):
-            post_github_review(owner, repo, pr_number, token, commit_id, [], "### ℹ️ Review Skipped\nThis PR contains docs only.")
-            profiler.stop("Pipeline: Full Process Execution")
-            return
-            
-        # Profile compilation step using explicit thread-safe cwd pathways (no os.chdir)
-        profiler.start("Triage validation: Local Compilers & Linters")
-        compile_status = run_native_compile_check(changed_file_paths, workspace_path)
-        profiler.stop("Triage validation: Local Compilers & Linters")
-        
-        if not compile_status["passed"]:
-            post_github_review(owner, repo, pr_number, token, commit_id, [], compile_status["error_msg"])
-            profiler.stop("Pipeline: Full Process Execution")
-            return
-            
         conventions = get_repo_conventions(owner, repo, token)
         db_path = os.path.join(workspace_path, ".code-review-graph", "graph.db")
         
@@ -1203,7 +1226,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-===== /root/code-review-agent/app/models.py =====
+===== ./app/models.py =====
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
@@ -1241,7 +1264,7 @@ class SubagentResponse(BaseModel):
     findings: List[SubagentFinding] = Field(default_factory=list)
     context_request: Optional[ContextRequest] = Field(None, description="Context requested strictly when status is 'NEEDS_CONTEXT'.")
 
-===== /root/code-review-agent/app/orchestrator.py =====
+===== ./app/orchestrator.py =====
 import json
 import os
 import re
@@ -1443,6 +1466,42 @@ def compile_symbol_bundle(qual_name: str, cache: SharedContextCache, neighbors: 
             lines.append(f"\nRelated Class interface '{cls}':\n{cache.get_body(cls)}")
     return "\n".join(lines)
 
+def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: SharedContextCache) -> str:
+    """
+    Executes a proactive semantic search seeded from the query text.
+    Injects matches directly into the cache and prompt to resolve 'unknown unknowns'.
+    """
+    from app.llm_client import _context
+    owner = _context.get("owner")
+    repo = _context.get("repo")
+    if not (owner and repo and symbol_index):
+        return ""
+        
+    collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_")
+    try:
+        from app.semantic_index import search_semantic
+        # Safety Truncation: Prevents massive diff payloads from exceeding model embedding context limits
+        truncated_query = query_text[:8000]
+        matches = search_semantic(truncated_query, collection_name, limit=3)
+        semantic_lines = []
+        
+        for match in matches:
+            payload_data = match.get("payload", {})
+            m_qual = payload_data.get("symbol")
+            if m_qual and m_qual in symbol_index:
+                m_meta = symbol_index[m_qual]
+                if not cache.contains(m_qual):
+                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
+                    cache.add(m_qual, m_meta, m_body)
+                semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
+                
+        if semantic_lines:
+            return "\n--- PROACTIVE SEMANTIC DISCOVERIES ---\n" + "\n".join(semantic_lines)
+    except Exception as e:
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Proactive semantic lookups bypassed: {e}")
+    return ""
+
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
     if is_debug_mode():
         print(f"[DEBUG] [Orchestrator] Spawning worker: '{role}'", flush=True)
@@ -1454,34 +1513,31 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     
     role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
     prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
-    try:
-        # Dynamically switch between execution engines
-        backend = config.get("LLM_BACKEND", "gemini")
-        if backend == "ollama":
-            raw_out = call_local_llm(prompt, role_instruction, SubagentResponse)
-        else:
-            raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
-            
-        cleaned = raw_out.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
+    
+    # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes
+    backend = config.get("LLM_BACKEND", "gemini")
+    if backend == "ollama":
+        raw_out = call_local_llm(prompt, role_instruction, SubagentResponse)
+    else:
+        raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
         
-        resp = SubagentResponse(**json.loads(cleaned.strip()))
+    cleaned = raw_out.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    
+    resp = SubagentResponse(**json.loads(cleaned.strip()))
+    
+    if is_debug_mode():
+        print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
+        print(raw_out, flush=True)
+        print("-"*98 + "\n", flush=True)
+        print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
         
-        if is_debug_mode():
-            print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
-            print(raw_out, flush=True)
-            print("-"*98 + "\n", flush=True)
-            print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-            
-        return resp
-    except Exception as e:
-        print(f"Subagent {role} failed: {e}", flush=True)
-        return SubagentResponse(status="SUCCESS", findings=[])
+    return resp
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
     system_inst = "You are a code symbol mapping router. Match requested vague expressions to exact symbol paths."
@@ -1529,12 +1585,21 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
     profiler = PipelineProfiler()
     roles = ["Architecture", "Logic", "Security"]
     
-    # Profile Pass 1 Parallel LLM calls
-    profiler.start("Orchestrator: Pass 1 Parallel LLM Reviews")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
-        results = {futures[f]: f.result() for f in futures}
-    profiler.stop("Orchestrator: Pass 1 Parallel LLM Reviews")
+    # Parity parallelization logic to protect Ollama CPU limits [3]
+    backend = get_config().get("LLM_BACKEND", "gemini")
+    
+    profiler.start("Orchestrator: Pass 1 LLM Reviews")
+    if backend == "ollama":
+        # Sequential execution on local backends to prevent thread thrashing
+        results = {}
+        for role in roles:
+            results[role] = run_single_subagent(role, chunk_payload, conventions_text)
+    else:
+        # Multi-threaded parallel execution for Cloud API endpoints
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(run_single_subagent, role, chunk_payload, conventions_text): role for role in roles}
+            results = {futures[f]: f.result() for f in futures}
+    profiler.stop("Orchestrator: Pass 1 LLM Reviews")
         
     escalated_symbols, escalated_roles, tracked_findings = [], [], {}
     semantic_queries_map = {}
@@ -1547,16 +1612,13 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
             functions_req = list(req.functions)
             classes_req = list(req.classes)
             
-            # Enforce configuration key constraint if defined
             config = get_config()
             max_calls = config.get("MAX_ROUTER_CALLS_PER_CHUNK", 1)
             
-            # Extract semantic queries from the subagent schema [3]
             subagent_queries = getattr(req, "semantic_queries", []) or []
             if subagent_queries:
                 semantic_queries_map.setdefault(role, []).extend(subagent_queries)
 
-            # Fallback natural language text extractor - refined to avoid noisy 4-letter word capture
             if not functions_req and not classes_req and not subagent_queries and req.why:
                 why_symbols = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", req.why)
                 candidate_words = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", req.why)
@@ -1584,11 +1646,10 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
         profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         newly_retrieved_context = []
 
-        # 1. Evaluate Semantic Natural Language Searches first [3]
         if semantic_queries_map:
             from app.semantic_index import search_semantic
             for role, queries in list(semantic_queries_map.items()):
-                for query in queries[:3]:  # Top 3 concepts per pass
+                for query in queries[:3]:
                     matches = search_semantic(query, collection_name, limit=3)
                     for match in matches:
                         meta_payload = match.get("payload", {})
@@ -1599,9 +1660,8 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                                 m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
                                 cache.add(m_qual, m_meta, m_body)
                             newly_retrieved_context.append(f"--- Semantic Vector Search Match ({m_qual}) ---\n{cache.get_body(m_qual)}")
-            semantic_queries_map.clear()  # Clear for this turn
+            semantic_queries_map.clear()
 
-        # 2. Evaluate Exact Structural AST Lookups
         for sym in escalated_symbols:
             if cache.contains(sym):
                 newly_retrieved_context.append(f"--- Cached Symbol Definition ({sym}) ---\n{cache.get_body(sym)}")
@@ -1611,7 +1671,6 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                 cache.add(sym, meta, body)
                 newly_retrieved_context.append(f"--- Resolved Symbol Definition ({sym}) ---\n{body}")
             else:
-                # Search the active HEAD database
                 search_results = crg_search_symbols(db_path, sym, limit=5)
                 exact_match = None
                 for res in search_results:
@@ -1625,7 +1684,6 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                     cache.add(sym, {"file_path": rel_file, "line_range": target_node["line_range"]}, body)
                     newly_retrieved_context.append(f"--- Search Resolved Symbol Definition ({sym}) ---\n{body}")
                 else:
-                    # Symbol is deleted from HEAD. Query the pre-change BASE database to check for dangling imports!
                     base_sha = _context.get("base_sha")
                     from app.repo_intelligence import INTEL_DIR
                     base_db_path = os.path.join(INTEL_DIR, f"{base_sha}.db") if base_sha else ""
@@ -1657,14 +1715,13 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
         payload = f"{payload}\n\n--- Escalated Resolved Context (Pass {round_idx + 2}) ---\n{augmented}"
         profiler.stop(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         
-        # Profile subsequent escalation rounds
-        profiler.start(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        profiler.start(f"Orchestrator: Pass {round_idx + 2} LLM Reviews")
         next_roles, next_symbols = [], []
-        with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
-            retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
-            for rf in retry_futures:
-                role = retry_futures[rf]
-                resp = rf.result()
+        
+        if backend == "ollama":
+            # Sequential re-evaluation
+            for role in escalated_roles:
+                resp = run_single_subagent(role, payload, conventions_text)
                 for f in resp.findings:
                     tracked_findings[(role, f.position)] = f
                 if resp.status == "NEEDS_CONTEXT" and resp.context_request:
@@ -1676,8 +1733,26 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                     if funcs or classes or req.configs or sub_q:
                         next_roles.append(role)
                         next_symbols.extend(funcs + classes + req.configs)
+        else:
+            # Parallel re-evaluation
+            with ThreadPoolExecutor(max_workers=len(escalated_roles)) as executor:
+                retry_futures = {executor.submit(run_single_subagent, role, payload, conventions_text): role for role in escalated_roles}
+                for rf in retry_futures:
+                    role = retry_futures[rf]
+                    resp = rf.result()
+                    for f in resp.findings:
+                        tracked_findings[(role, f.position)] = f
+                    if resp.status == "NEEDS_CONTEXT" and resp.context_request:
+                        req = resp.context_request
+                        funcs, classes = list(req.functions), list(req.classes)
+                        sub_q = getattr(req, "semantic_queries", []) or []
+                        if sub_q:
+                            semantic_queries_map.setdefault(role, []).extend(sub_q)
+                        if funcs or classes or req.configs or sub_q:
+                            next_roles.append(role)
+                            next_symbols.extend(funcs + classes + req.configs)
                         
-        profiler.stop(f"Orchestrator: Pass {round_idx + 2} Parallel Escalated LLM Reviews")
+        profiler.stop(f"Orchestrator: Pass {round_idx + 2} LLM Reviews")
         escalated_roles, escalated_symbols = next_roles, next_symbols
         round_idx += 1
 
@@ -1695,14 +1770,30 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
     populate_cache_for_symbol(db_path, qual_name, symbol_index, cache, dep_hops=dep_hops)
     neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
     symbol_bundle = compile_symbol_bundle(qual_name, cache, neighbors)
+    
+    # ─── Proactive Semantic Context Pass ───
+    proactive_context = ""
+    changed_code = cache.get_body(qual_name)
+    if changed_code:
+        proactive_context = get_proactive_semantic_context(changed_code, symbol_index, cache)
+        
     chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
+    if proactive_context:
+        chunk_payload = f"{chunk_payload}\n{proactive_context}"
     
     return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
 
 def orchestrate_chunk_review(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_escalation_rounds: int = 1) -> list:
-    return run_escalation_rounds(chunk_payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
+    # ─── Proactive Semantic Context Pass ───
+    proactive_context = get_proactive_semantic_context(chunk_payload, symbol_index, cache)
+    payload = chunk_payload
+    if proactive_context:
+        payload = f"{chunk_payload}\n{proactive_context}"
+        
+    return run_escalation_rounds(payload, conventions_text, symbol_index, db_path, cache, max_rounds=max_escalation_rounds)
 
-===== /root/code-review-agent/app/output_parser.py =====
+
+===== ./app/output_parser.py =====
 import json
 from typing import List
 from app.models import CodeReviewResponse, CodeComment
@@ -1782,7 +1873,7 @@ def build_github_review_payload(comments: List[CodeComment]) -> List[dict]:
             "body": body
         })
     return gh_comments
-===== /root/code-review-agent/app/profiler.py =====
+===== ./app/profiler.py =====
 import time
 import threading
 from collections import defaultdict
@@ -1827,7 +1918,7 @@ class PipelineProfiler:
                 print(f" - {phase:<45}: {duration:7.3f}s ({pct:5.1f}%)")
             print(f" - Total Profiled Execution Duration           : {total:7.3f}s")
             print("=" * 77 + "\n")
-===== /root/code-review-agent/app/prompt_builder.py =====
+===== ./app/prompt_builder.py =====
 from typing import List
 
 def build_subagent_system_instruction(role: str, role_focus: str = "", conventions_text: str = "", static_baseline: str = "") -> str:
@@ -1860,9 +1951,10 @@ MANDATORY ESCALATION PROTOCOL (VERIFICATION BEFORE AUDITING):
 - Do NOT guess. Verify first. Speculating without verification is a hallucination.
 
 CONTEXT RETRIEVAL RULES (IF STATUS IS 'NEEDS_CONTEXT'):
-1. Use exact simple names (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`).
-2. Do NOT request context inside 'why' only. You MUST append names in "functions" or "classes" arrays.
-3. Empty arrays mean no context gets retrieved.
+1. Use exact simple names for exact symbols (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`) inside 'functions' or 'classes'.
+2. If you want to explore conceptually related patterns, similar logic, or precedents in the codebase but do not know the exact class or function names, you MUST supply natural language descriptions inside the 'semantic_queries' array to query our vector database (e.g., 'JWT token extraction and validation', 'how payment retry limits are configured').
+3. Do NOT request context inside 'why' only. You MUST append search terms inside 'functions', 'classes', or 'semantic_queries' arrays.
+4. Empty arrays mean no context gets retrieved.
 
 Structure response strictly as a single JSON object matching this schema. No markdown outside:
 {{
@@ -1881,6 +1973,7 @@ Structure response strictly as a single JSON object matching this schema. No mar
     "functions": ["exact external function names needed"],
     "classes": ["exact class names needed"],
     "configs": ["exact configuration keys needed"],
+    "semantic_queries": ["natural language search queries for our vector database to locate conceptually related logic"],
     "why": "brief reasoning"
   }} (optional: provide strictly if status is 'NEEDS_CONTEXT')
 }}
@@ -1904,7 +1997,8 @@ def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[st
             l_num = line_num if line_num is not None else ""
             lines_repr.append(f"{l_num}:{char}{content} (DP:{diff_pos})")
     return ["\n".join(lines_repr)]
-===== /root/code-review-agent/app/repo_checks.py =====
+
+===== ./app/repo_checks.py =====
 import os
 import re
 import requests
@@ -1974,7 +2068,7 @@ def fetch_and_validate_commits(owner: str, repo: str, pr_number: str, token: str
     except Exception as e:
         print(f"Warning: Commit checking errored: {e}")
     return suggestions
-===== /root/code-review-agent/app/repo_intelligence.py =====
+===== ./app/repo_intelligence.py =====
 import os
 import json
 import argparse
@@ -2193,7 +2287,7 @@ if __name__ == "__main__":
     parser.add_argument("--commit", required=True, help="Target Commit SHA key")
     args = parser.parse_args()
     build_repo_intelligence(args.repo_dir, args.commit)
-===== /root/code-review-agent/app/triage.py =====
+===== ./app/triage.py =====
 # ===== /root/code-review-agent/app/triage.py =====
 import os
 import sys
@@ -2320,7 +2414,7 @@ def run_native_compile_check(changed_files: list, workspace_path: str = ".") -> 
         return {"passed": False, "error_msg": full_message}
 
     return {"passed": True, "error_msg": ""}
-===== /root/code-review-agent/app/validator.py =====
+===== ./app/validator.py =====
 import re
 from app.models import CodeComment
 
@@ -2385,9 +2479,10 @@ def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_dif
             )
             deduped.append(merged_comment)
     return deduped
-===== /root/code-review-agent/app/semantic_index.py =====
+===== ./app/semantic_index.py =====
 import uuid
 import hashlib
+import os
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from app.config import get_config, is_debug_mode
@@ -2425,14 +2520,14 @@ def ensure_qdrant_collection(collection_name: str) -> bool:
         return False
 
 def scroll_active_points(collection_name: str) -> dict:
-    """Scrolls and retrieves all existing points and hashes stored in the collection."""
+    """Scrolls and retrieves all existing points, hashes, and paths stored in the collection."""
     qdrant_host = get_config().get("QDRANT_HOST", "http://localhost:6333")
     url = f"{qdrant_host}/collections/{collection_name}/points/scroll"
     points = {}
     next_page = None
     
     while True:
-        payload = {"limit": 100, "with_payload": ["hash"]}
+        payload = {"limit": 100, "with_payload": ["hash", "path"]}
         if next_page:
             payload["offset"] = next_page
             
@@ -2442,7 +2537,10 @@ def scroll_active_points(collection_name: str) -> dict:
                 break
             data = r.json().get("result", {})
             for point in data.get("points", []):
-                points[point["id"]] = point.get("payload", {}).get("hash")
+                points[point["id"]] = {
+                    "hash": point.get("payload", {}).get("hash"),
+                    "path": point.get("payload", {}).get("path")
+                }
             next_page = data.get("next_page_offset")
             if not next_page:
                 break
@@ -2467,10 +2565,9 @@ def get_ollama_embedding(text: str) -> list:
             print(f"[DEBUG] [SemanticIndex] Failed to get Ollama embedding: {e}")
     return []
 
-def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: dict):
+def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: dict, dependency_graph: dict, changed_files: list):
     """
-    Builds or incrementally syncs the local Qdrant collection with active symbols.
-    Deletes stale elements that are no longer in the code repository.
+    Builds or incrementally syncs local Qdrant vectors for changed files and direct dependencies.
     """
     collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_")
     
@@ -2478,26 +2575,42 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
         print(f"[SemanticIndex] Failed to establish Qdrant collection for '{collection_name}'. Skipping.")
         return
 
-    print(f"[SemanticIndex] Syncing Qdrant index for '{collection_name}' (HEAD Commit: {commit_sha})...")
+    # Filter indexing targets to only include: changed files + files that import/are imported by them
+    files_to_index = set(changed_files)
+    for f in changed_files:
+        if f in dependency_graph:
+            files_to_index.update(dependency_graph[f].get("imports", []))
+            files_to_index.update(dependency_graph[f].get("imported_by", []))
 
-    # Fetch what is currently in Qdrant
+    filtered_symbols = {
+        qual_name: meta for qual_name, meta in symbol_index.items()
+        if meta["file_path"] in files_to_index
+    }
+
+    print(f"[SemanticIndex] Syncing Qdrant index: '{collection_name}' ({len(filtered_symbols)} active symbols across {len(files_to_index)} files)...")
+
+    # Fetch existing mappings
     existing_vectors = scroll_active_points(collection_name)
     active_uuids = set()
     updates = []
+    
+    from app.llm_client import _context
+    workspace_path = _context.get("workspace", "")
 
-    # Map current files to symbols and detect changes
-    for qual_name, meta in symbol_index.items():
+    for qual_name, meta in filtered_symbols.items():
         symbol_uuid = get_symbol_uuid(collection_name, qual_name)
         active_uuids.add(symbol_uuid)
 
-        content = get_symbol_signature_or_content(meta["file_path"], meta["line_range"], fallback_only=False)
+        # Pre-resolve to absolute paths so we read directly from local SSD cache instead of API
+        abs_filepath = os.path.join(workspace_path, meta["file_path"])
+        content = get_symbol_signature_or_content(abs_filepath, meta["line_range"], fallback_only=False)
         if not content.strip():
             continue
 
         code_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         
-        # If hash is already indexed and unchanged, we skip the embedding generation
-        if symbol_uuid in existing_vectors and existing_vectors[symbol_uuid] == code_hash:
+        # Incremental check
+        if symbol_uuid in existing_vectors and existing_vectors[symbol_uuid]["hash"] == code_hash:
             continue
 
         updates.append({
@@ -2508,12 +2621,11 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
             "hash": code_hash
         })
 
-    # Embed and upsert in parallel to reduce processing latency
+    # Embed and upsert modified elements
     if updates:
-        print(f"[SemanticIndex] Generating embeddings for {len(updates)} modified or new symbols...")
+        print(f"[SemanticIndex] Embedding {len(updates)} updated symbols in parallel threads...")
         
         def process_update(u):
-            # Format text representation with rich schema metadata
             context_text = f"Path: {u['meta']['file_path']}\nSymbol: {u['qual_name']}\nType: {u['meta'].get('type', 'symbol')}\nCode:\n{u['content']}"
             vector = get_ollama_embedding(context_text)
             if vector:
@@ -2531,7 +2643,6 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
                 }
             return None
 
-        # Execute Ollama embedding calls concurrently
         points_to_upsert = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             results = executor.map(process_update, updates)
@@ -2546,10 +2657,13 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
                 requests.put(upsert_url, json={"points": points_to_upsert}, timeout=15)
                 print(f"[SemanticIndex] Successfully upserted {len(points_to_upsert)} points.")
             except Exception as e:
-                print(f"[SemanticIndex] Failed to upload points to Qdrant: {e}")
+                print(f"[SemanticIndex] Failed to upload points: {e}")
 
-    # Prune symbols that were deleted from the codebase
-    stale_uuids = [uid for uid in existing_vectors if uid not in active_uuids]
+    # Prune ONLY stale symbols belonging to the active files we evaluated
+    stale_uuids = [
+        uid for uid, info in existing_vectors.items()
+        if info.get("path") in files_to_index and uid not in active_uuids
+    ]
     if stale_uuids:
         print(f"[SemanticIndex] Pruning {len(stale_uuids)} stale points from Vector DB...")
         qdrant_host = get_config().get("QDRANT_HOST", "http://localhost:6333")

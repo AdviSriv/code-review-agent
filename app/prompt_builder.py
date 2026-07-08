@@ -30,9 +30,10 @@ MANDATORY ESCALATION PROTOCOL (VERIFICATION BEFORE AUDITING):
 - Do NOT guess. Verify first. Speculating without verification is a hallucination.
 
 CONTEXT RETRIEVAL RULES (IF STATUS IS 'NEEDS_CONTEXT'):
-1. Use exact simple names (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`).
-2. Do NOT request context inside 'why' only. You MUST append names in "functions" or "classes" arrays.
-3. Empty arrays mean no context gets retrieved.
+1. Use exact simple names for exact symbols (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`) inside 'functions' or 'classes'.
+2. If you want to explore conceptually related patterns, similar logic, or precedents in the codebase but do not know the exact class or function names, you MUST supply natural language descriptions inside the 'semantic_queries' array to query our vector database (e.g., 'JWT token extraction and validation', 'how payment retry limits are configured').
+3. Do NOT request context inside 'why' only. You MUST append search terms inside 'functions', 'classes', or 'semantic_queries' arrays.
+4. Empty arrays mean no context gets retrieved.
 
 Structure response strictly as a single JSON object matching this schema. No markdown outside:
 {{
@@ -51,6 +52,7 @@ Structure response strictly as a single JSON object matching this schema. No mar
     "functions": ["exact external function names needed"],
     "classes": ["exact class names needed"],
     "configs": ["exact configuration keys needed"],
+    "semantic_queries": ["natural language search queries for our vector database to locate conceptually related logic"],
     "why": "brief reasoning"
   }} (optional: provide strictly if status is 'NEEDS_CONTEXT')
 }}

@@ -190,3 +190,25 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
             requests.post(delete_url, json={"points": stale_uuids}, timeout=10)
         except Exception as e:
             print(f"[SemanticIndex] Stale point deletion failed: {e}")
+
+def search_semantic(query_text: str, collection_name: str, limit: int = 3) -> list:
+    """Queries Qdrant for closely matched code blocks using nomic-embed-text."""
+    query_vector = get_ollama_embedding(query_text)
+    if not query_vector:
+        return []
+
+    qdrant_host = get_config().get("QDRANT_HOST", "http://localhost:6333")
+    url = f"{qdrant_host}/collections/{collection_name}/points/search"
+    payload = {
+        "vector": query_vector,
+        "limit": limit,
+        "with_payload": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("result", [])
+    except Exception as e:
+        if is_debug_mode():
+            print(f"[DEBUG] [SemanticIndex] Search request failed: {e}")
+    return []
