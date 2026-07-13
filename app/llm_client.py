@@ -1,3 +1,4 @@
+# ===== app/llm_client.py =====
 
 import os
 import time
@@ -179,7 +180,7 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     profiler = PipelineProfiler()
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
-    model = os.getenv("LLM_MODEL", "qwen2.5-coder:14b")
+    model = os.getenv("LLM_MODEL", "deepseek-r1:8b")  # Replaced default value with pulled model
 
     # Ollama does NOT automatically infer context window from prompt length.
     # Set explicit num_ctx options here to prevent silent front/back context truncation.
@@ -213,8 +214,17 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     }
     
     if response_schema is not None:
-        raw_schema = response_schema.model_json_schema()
-        payload["format"] = simplify_schema_for_local_llm(raw_schema)
+        # DeepSeek-R1 models use reasoning traces (<think> tags).
+        # Passing a JSON schema constraint to Ollama's 'format' parameter uses GBNF grammars
+        # which force JSON from token 1, completely blocking the <think> tag and disabling R1's reasoning.
+        # Bypass 'format' constraint for deepseek-r1 to let it reason naturally,
+        # and rely on our robust regex parser in orchestrator.py to extract JSON.
+        if "deepseek-r1" in model.lower():
+            if is_debug_mode():
+                print("[DEBUG] [Local LLM Client] DeepSeek-R1 detected. Bypassing Ollama 'format' constraint to enable reasoning (<think> tags).", flush=True)
+        else:
+            raw_schema = response_schema.model_json_schema()
+            payload["format"] = simplify_schema_for_local_llm(raw_schema)
         
     if is_debug_mode():
         print("\n" + "="*40 + " OLLAMA LOCAL PROMPT " + "="*40, flush=True)

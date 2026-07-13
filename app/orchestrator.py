@@ -1,3 +1,5 @@
+# ===== app/orchestrator.py =====
+
 import json
 import os
 import re
@@ -287,12 +289,22 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
 
 def _strip_code_fences(raw_out: str) -> str:
     cleaned = raw_out.strip()
+    
+    # Robustly locate and extract json code blocks
+    # This is extremely important for reasoning models like deepseek-r1 that output <think>...</think> traces first.
+    json_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if json_block_match:
+        return json_block_match.group(1).strip()
+        
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
     if cleaned.startswith("```"):
         cleaned = cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
+        
+    # Erase any leftover thinking traces if they leaked into the stripped string
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned.strip()
 
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
@@ -306,10 +318,14 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     
     backend = config.get("LLM_BACKEND", "gemini")
     base_prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
-    
+
     if backend == "ollama":
         # Ollama-only path: reasoning-first schema, tailored prompt with few-shot
-        # examples, and a bounded retry loop with corrective feedback.
+        # examples, and a bounded retry loop with corrective feedback. A single
+        # local-model hiccup (invalid JSON, truncated generation, a schema-valid
+        # but nonsensical response) must NOT crash the whole PR review — it should
+        # be retried, and if still failing, degrade to an empty SUCCESS result for
+        # just this one role/chunk so every other task still gets reviewed and posted.
         role_instruction = build_subagent_system_instruction_ollama(role, role_focus, conventions_text, baseline)
         max_retries = int(config.get("MAX_LOCAL_PARSE_RETRIES", 2))
         prompt = base_prompt
@@ -322,17 +338,16 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
                 last_raw = raw_out
                 cleaned = _strip_code_fences(raw_out)
                 data = json.loads(cleaned)
-                
-                # Parse into the canonical SubagentResponse. The 'reasoning' field
-                # is safely ignored thanks to pydantic's default extra="ignore" strategy.
+                # Always parse into the canonical SubagentResponse. The Ollama-only
+                # 'reasoning' key is simply ignored (pydantic extra="ignore" default).
                 resp = SubagentResponse(**data)
-                
+
                 if is_debug_mode():
                     print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
                     print(raw_out, flush=True)
                     print("-"*98 + "\n", flush=True)
                     print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-                    
+
                 return resp
             except Exception as e:
                 last_error = e
@@ -348,27 +363,29 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
                     )
                     prompt = base_prompt + correction
                     continue
-                
-                # Retries exhausted: degrade gracefully so we don't crash the entire pipeline
+                # Retries exhausted: fail this one role/chunk gracefully instead of
+                # crashing the entire PR review. Loudly logged so it's never a
+                # silent, invisible failure — just a bounded one.
                 print(f"[Orchestrator] [Ollama] Subagent '{role}' failed after {max_retries+1} attempts "
-                      f"({type(e).__name__}: {last_error}). Falling back to empty SUCCESS result.", flush=True)
+                      f"({type(e).__name__}: {last_error}). Falling back to an empty SUCCESS result for this "
+                      f"role/chunk only; other tasks are unaffected.", flush=True)
                 return SubagentResponse(status="SUCCESS", findings=[])
     else:
         role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
         prompt = base_prompt
-        
-        # Propagate exception up directly (No Swallow) to prevent silent failures on Gemini
+
+        # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
-        
+
         cleaned = _strip_code_fences(raw_out)
         resp = SubagentResponse(**json.loads(cleaned))
-        
+
         if is_debug_mode():
             print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
             print(raw_out, flush=True)
             print("-"*98 + "\n", flush=True)
             print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-            
+
         return resp
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
