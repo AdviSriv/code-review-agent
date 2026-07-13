@@ -1,3 +1,4 @@
+# ===== /root/code-review-agent/app/main.py =====
 import os
 import sys
 import argparse
@@ -235,25 +236,24 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             
             changed_symbols = get_changed_symbols_in_file(db_path, filepath_abs, modified_lines)
             
+            # Formulate robust context of defined/modified symbols in this file
+            symbols_info = ""
             if changed_symbols:
+                symbols_info = "\n--- AST SYMBOLS DEFINED OR MODIFIED IN THIS FILE ---\n"
                 for sym in changed_symbols:
-                    review_tasks.append({
-                        "type": "symbol",
-                        "filename": filename,
-                        "parsed_diff": parsed_diff,
-                        "sym": sym
-                    })
-            else:
-                chunks = chunk_file_diffs(filename, lang, parsed_diff)
-                for chunk in chunks:
-                    dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
-                    payload = f"{chunk}\n\n{dep_bundle}"
-                    review_tasks.append({
-                        "type": "chunk",
-                        "filename": filename,
-                        "parsed_diff": parsed_diff,
-                        "payload": payload
-                    })
+                    symbols_info += f"- {sym['kind'].upper()}: '{sym['qualified_name']}' (Lines {sym['line_range'][0]}-{sym['line_range'][1]})\n"
+            
+            # Map review pipeline to optimized chunk-centric tasks to avoid serial task explosion [cl1]
+            chunks = chunk_file_diffs(filename, lang, parsed_diff)
+            for chunk in chunks:
+                dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
+                payload = f"{chunk}\n{symbols_info}\n{dep_bundle}"
+                review_tasks.append({
+                    "type": "chunk",
+                    "filename": filename,
+                    "parsed_diff": parsed_diff,
+                    "payload": payload
+                })
 
         # 2. Worker task executor
         def execute_review_task(task):
@@ -266,7 +266,6 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
                 if task["type"] == "symbol":
                     sym = task["sym"]
                     print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
-                    # FIXED: Added parsed_diff, filename, and lang parameters to allow symbol reviews to inspect diff patches.
                     symbol_comments = orchestrate_symbol_review(
                         sym, symbol_index, conventions, cache, db_path,
                         dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds,
@@ -282,8 +281,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
                     )
                     return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
             except Exception as e:
-                # If using local Ollama model, catch exceptions so a single model crash or connection drop
-                # does not discard other successfully evaluated tasks. Gemini propagates for direct debugging.
+                # If using local Ollama model, catch exceptions so a single model crash or connection drop 
+                # does not discard all other successful reviews. Gemini propagates for direct debugging.
                 if backend == "ollama":
                     print(f"[Pipeline] [Ollama] Task on '{filename}' failed ({type(e).__name__}: {e}). Skipping task gracefully.", flush=True)
                     return []

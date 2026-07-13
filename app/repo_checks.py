@@ -26,14 +26,17 @@ def fetch_github_file(owner: str, repo: str, filename: str, token: str) -> str:
         pass
     return ""
 
+# ===== app/repo_checks.py =====
+
 def get_repo_conventions(owner: str = None, repo: str = None, token: str = None) -> str:
-    for name in ["AGENTS.md", "CLAUDE.md"]:
+    # Added singular variations ('agent.md', 'AGENT.md') to seamlessly ingest your local file
+    for name in ["agent.md", "AGENT.md", "AGENTS.md", "CLAUDE.md"]:
         content = read_local_file(name)
         if content:
             return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
             
     if owner and repo and token:
-        for name in ["AGENTS.md", "CLAUDE.md"]:
+        for name in ["agent.md", "AGENT.md", "AGENTS.md", "CLAUDE.md"]:
             content = fetch_github_file(owner, repo, name, token)
             if content:
                 return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"

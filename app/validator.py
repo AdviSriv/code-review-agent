@@ -33,12 +33,20 @@ def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
 
 def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_diff_file: dict) -> list:
     valid_comments = []
+    line_to_pos = parsed_diff_file.get("line_to_position", {})
+    added_lines = parsed_diff_file.get("added_lines", {})
     valid_positions = parsed_diff_file.get("valid_positions", set())
+    
+    # Map newly added or modified line numbers to their exact 1-based diff positions (green lines starting with '+')
+    added_positions = {line_to_pos[line_num] for line_num in added_lines if line_num in line_to_pos}
+    # Fallback to general valid positions if added lines positions can't be resolved
+    allowed_positions = added_positions if added_positions else valid_positions
     
     for f in findings:
         f.file = file_path
-        if f.position not in valid_positions:
-            print(f"[Validator] Rejected hallucinated position {f.position} on {file_path}")
+        # Strictly reject comments targeted outside of newly modified or added diff lines
+        if f.position not in allowed_positions:
+            print(f"[Validator] Rejected comment at position {f.position} on {file_path} because it is on an unchanged baseline line.")
             continue
             
         if f.confidence < CONFIDENCE_THRESHOLD:
