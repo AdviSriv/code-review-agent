@@ -1,3 +1,4 @@
+
 import os
 import json
 import argparse
@@ -19,8 +20,16 @@ DEFAULT_CONFIG = {
     "ENABLE_STATIC_BASELINE": True,  # Toggle to include/exclude default static analysis baseline warnings
     "LLM_BACKEND": "gemini",         # Swappable: "gemini" or "ollama"
     "OLLAMA_HOST": "http://localhost:11434",
+    "OLLAMA_NUM_CTX_MIN": 4096,       # Floor for Ollama's context window (num_ctx).
+                                      # Ensures prompts aren't silently truncated by small Ollama defaults.
+    "OLLAMA_NUM_CTX_MAX": 8192,       # Ceiling for num_ctx, calibrated for memory constraints with a 14B model.
+    "OLLAMA_NUM_PREDICT": 2048,       # Max output tokens per subagent call to prevent partial JSON truncation.
+    "MAX_LOCAL_PARSE_RETRIES": 2,     # Retries for a single subagent call when Ollama returns invalid/truncated JSON.
     "QDRANT_HOST": "http://localhost:6333",
-    "EMBEDDING_MODEL": "nomic-embed-text"
+    "EMBEDDING_MODEL": "nomic-embed-text",
+    "EMBEDDING_TIMEOUT": 30.0,
+    "EMBEDDING_MAX_CHARS": 6000,     # Safety character limit to fit 2048-token constraints
+    "SEMANTIC_SCORE_THRESHOLD": 0.30  # Safety similarity margin adjusted to 0.30
 }
 
 _debug_mode = True

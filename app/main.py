@@ -1,4 +1,3 @@
-# ===== /root/code-review-agent/app/main.py =====
 import os
 import sys
 import argparse
@@ -13,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 # Config and parsers
-from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode
+from app.config import get_secret, get_repo_pat, set_debug_mode, is_debug_mode, get_config
 from app.diff_parser import parse_patch, parse_full_diff, is_ignored_file, identify_language
 from app.prompt_builder import chunk_file_diffs
 import app.llm_client as llm_client
@@ -260,29 +259,45 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
         def execute_review_task(task):
             filename = task["filename"]
             parsed_diff = task["parsed_diff"]
+            lang = identify_language(filename)
+            backend = get_config().get("LLM_BACKEND", "gemini")
             
-            if task["type"] == "symbol":
-                sym = task["sym"]
-                print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
-                symbol_comments = orchestrate_symbol_review(
-                    sym, symbol_index, conventions, cache, db_path,
-                    dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds
-                )
-                return validate_and_deduplicate_comments(symbol_comments, filename, parsed_diff)
-            else:
-                payload = task["payload"]
-                print(f"[Pipeline] Analysing file chunks: '{filename}'...", flush=True)
-                chunk_comments = orchestrate_chunk_review(
-                    payload, conventions, symbol_index, db_path, cache,
-                    max_escalation_rounds=max_escalation_rounds
-                )
-                return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
+            try:
+                if task["type"] == "symbol":
+                    sym = task["sym"]
+                    print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
+                    # FIXED: Added parsed_diff, filename, and lang parameters to allow symbol reviews to inspect diff patches.
+                    symbol_comments = orchestrate_symbol_review(
+                        sym, symbol_index, conventions, cache, db_path,
+                        dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds,
+                        parsed_diff=parsed_diff, filename=filename, language=lang
+                    )
+                    return validate_and_deduplicate_comments(symbol_comments, filename, parsed_diff)
+                else:
+                    payload = task["payload"]
+                    print(f"[Pipeline] Analysing file chunks: '{filename}'...", flush=True)
+                    chunk_comments = orchestrate_chunk_review(
+                        payload, conventions, symbol_index, db_path, cache,
+                        max_escalation_rounds=max_escalation_rounds
+                    )
+                    return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
+            except Exception as e:
+                # If using local Ollama model, catch exceptions so a single model crash or connection drop
+                # does not discard other successfully evaluated tasks. Gemini propagates for direct debugging.
+                if backend == "ollama":
+                    print(f"[Pipeline] [Ollama] Task on '{filename}' failed ({type(e).__name__}: {e}). Skipping task gracefully.", flush=True)
+                    return []
+                else:
+                    raise e
 
         # 3. Parallelize the reviews across thread pools safely protected by central RateGatekeeper
         all_comments = []
         if review_tasks:
             profiler.start("Pipeline: Parallel LLM Task Execution")
-            with ThreadPoolExecutor(max_workers=min(len(review_tasks), 4)) as executor:
+            # FIXED: Cap max_workers to 1 to serialize tasks when using Ollama to avoid resource exhaustion.
+            backend = get_config().get("LLM_BACKEND", "gemini")
+            max_workers = 1 if backend == "ollama" else min(len(review_tasks), 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 task_results = executor.map(execute_review_task, review_tasks)
                 for res in task_results:
                     all_comments.extend(res)
@@ -312,6 +327,16 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
         print(f"[Pipeline] Crash: {e}", flush=True)
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "healthy", "service": "code-review-agent"}).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self):
         print(f"\n[Webhook] Received incoming POST request on '{self.path}'", flush=True)
         

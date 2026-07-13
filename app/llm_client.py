@@ -1,11 +1,19 @@
+
 import os
 import time
 import threading
 import requests
+import copy
 from google import genai
 from google.genai import types
 from app.config import get_secret, is_debug_mode, get_config
 from app.profiler import PipelineProfiler
+
+class OllamaTruncatedResponseError(RuntimeError):
+    """Raised when Ollama reports done_reason == 'length', meaning generation was
+    cut off before completion (usually because num_predict was too small for the
+    requested JSON object)."""
+    pass
 
 _context = {
     "owner": "",
@@ -13,12 +21,10 @@ _context = {
     "token": "",
     "commit_sha": ""
 }
-
 _lock = threading.Lock()
 get_lines_counter = 0
 get_lines_limit = 2
 _gatekeeper_ref = None
-
 token_stats = {
     "prompt_tokens": 0,
     "candidates_tokens": 0,
@@ -40,7 +46,6 @@ def get_lines(file: str, start: int, end: int) -> str:
         
     if is_debug_mode():
         print(f"[DEBUG] [get_lines Tool] LLM invoked get_lines(file='{file}', start={start}, end={end}) [Call #{get_lines_counter}]")
-
     content = ""
     
     workspace = _context.get("workspace")
@@ -81,10 +86,8 @@ def get_lines(file: str, start: int, end: int) -> str:
                 
     if not content:
         return f"Error: File '{file}' not found locally or remote parameters missing."
-
     if get_config().get("LLM_BACKEND") == "ollama":
         return content
-
     content_tokens = int(len(content) / 4)
     if _gatekeeper_ref:
         profiler = PipelineProfiler()
@@ -102,6 +105,62 @@ def get_lines(file: str, start: int, end: int) -> str:
             profiler.record("Gatekeeper Wait: Tool API throttling", gatekeeper_wait_duration)
             
     return content
+
+def simplify_schema_for_local_llm(schema: dict) -> dict:
+    """
+    Recursively inlines all $ref definitions from $defs and simplifies anyOf Union types with null.
+    This resolves compatibility issues with local LLMs (e.g. qwen2.5-coder) parsing complex schemas.
+    """
+    schema = copy.deepcopy(schema)
+    defs = schema.pop('$defs', {})
+    
+    def resolve_refs(subschema):
+        if isinstance(subschema, dict):
+            if '$ref' in subschema:
+                ref_path = subschema['$ref']
+                def_name = ref_path.split('/')[-1]
+                if def_name in defs:
+                    resolved = resolve_refs(defs[def_name])
+                    merged = {k: v for k, v in subschema.items() if k != '$ref'}
+                    merged.update(resolved)
+                    return merged
+                return subschema
+            
+            new_schema = {}
+            for k, v in subschema.items():
+                new_schema[k] = resolve_refs(v)
+                
+            if 'anyOf' in new_schema:
+                any_of_list = new_schema['anyOf']
+                if len(any_of_list) == 2:
+                    first, second = any_of_list[0], any_of_list[1]
+                    if isinstance(first, dict) and first.get('type') == 'null':
+                        resolved = resolve_refs(second)
+                        if isinstance(resolved, dict):
+                            t = resolved.get('type', 'object')
+                            types = [t] if isinstance(t, str) else list(t)
+                            if 'null' not in types:
+                                types.append('null')
+                            merged = {k: v for k, v in resolved.items() if k != 'type'}
+                            merged['type'] = types
+                            return merged
+                    if isinstance(second, dict) and second.get('type') == 'null':
+                        resolved = resolve_refs(first)
+                        if isinstance(resolved, dict):
+                            t = resolved.get('type', 'object')
+                            types = [t] if isinstance(t, str) else list(t)
+                            if 'null' not in types:
+                                types.append('null')
+                            merged = {k: v for k, v in resolved.items() if k != 'type'}
+                            merged['type'] = types
+                            return merged
+                return {"anyOf": [resolve_refs(item) for item in any_of_list]}
+            return new_schema
+            
+        elif isinstance(subschema, list):
+            return [resolve_refs(item) for item in subschema]
+        return subschema
+    return resolve_refs(schema)
 
 def reset_telemetry_counters(limit: int = 2):
     global get_lines_counter, get_lines_limit
@@ -121,7 +180,23 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
     model = os.getenv("LLM_MODEL", "qwen2.5-coder:14b")
+
+    # Ollama does NOT automatically infer context window from prompt length.
+    # Set explicit num_ctx options here to prevent silent front/back context truncation.
+    num_predict = int(config.get("OLLAMA_NUM_PREDICT", 2048))
+    ctx_floor = int(config.get("OLLAMA_NUM_CTX_MIN", 4096))
+    ctx_ceiling = int(config.get("OLLAMA_NUM_CTX_MAX", 8192))
     
+    estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 4)
+    # Headroom for output generation and safety buffer, aligned to nearest 1024.
+    needed_ctx = estimated_input_tokens + num_predict + 512
+    needed_ctx = ((needed_ctx // 1024) + 1) * 1024
+    num_ctx = max(ctx_floor, min(needed_ctx, ctx_ceiling))
+
+    if is_debug_mode() and needed_ctx > ctx_ceiling:
+        print(f"[DEBUG] [Local LLM Client] Estimated prompt (~{estimated_input_tokens} tokens) plus output budget "
+              f"exceeds OLLAMA_NUM_CTX_MAX ({ctx_ceiling}). Using the ceiling; prompt might get truncated.")
+
     url = f"{ollama_host}/api/chat"
     payload = {
         "model": model,
@@ -130,20 +205,24 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
             {"role": "user", "content": prompt}
         ],
         "options": {
-            "temperature": 0.1
+            "temperature": 0.1,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
         },
         "stream": False
     }
     
     if response_schema is not None:
-        payload["format"] = response_schema.model_json_schema()
-
+        raw_schema = response_schema.model_json_schema()
+        payload["format"] = simplify_schema_for_local_llm(raw_schema)
+        
     if is_debug_mode():
         print("\n" + "="*40 + " OLLAMA LOCAL PROMPT " + "="*40, flush=True)
         print(f"[System Instruction]\n{system_instruction}\n", flush=True)
         print(f"[Prompt Payload]\n{prompt}", flush=True)
+        print(f"[Options] num_ctx={num_ctx} num_predict={num_predict} (estimated input ~{estimated_input_tokens} tokens)", flush=True)
         print("="*98 + "\n", flush=True)
-
+        
     max_retries = 3
     retry_delay = 3
     response_data = None
@@ -166,10 +245,10 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
             else:
                 profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
                 raise e
-
     profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
     
     content = response_data.get("message", {}).get("content", "")
+    done_reason = response_data.get("done_reason")
     
     prompt_tokens = response_data.get("prompt_eval_count", 0)
     candidates_tokens = response_data.get("eval_count", 0)
@@ -179,8 +258,14 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
         token_stats["candidates_tokens"] += candidates_tokens
         token_stats["total_tokens"] += (prompt_tokens + candidates_tokens)
         if is_debug_mode():
-            print(f"[DEBUG] [Local LLM Client] Call finished. Tokens used in turn: {prompt_tokens + candidates_tokens}", flush=True)
+            print(f"[DEBUG] [Local LLM Client] Call finished. Tokens used in turn: {prompt_tokens + candidates_tokens}, done_reason={done_reason}", flush=True)
             
+    if done_reason == "length":
+        raise OllamaTruncatedResponseError(
+            f"Ollama generation stopped due to length (num_predict={num_predict}) before completing the response. "
+            f"Output was likely truncated mid-JSON. Raw content: {content[:500]}"
+        )
+        
     return content
 
 def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:

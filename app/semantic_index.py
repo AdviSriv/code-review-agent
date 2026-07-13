@@ -23,10 +23,16 @@ def ensure_qdrant_collection(collection_name: str) -> bool:
         if r.status_code == 200:
             return True
         
+        # Dynamically determine vector size from the configured embedding model
+        test_vector = get_ollama_embedding("test", task="document")
+        vector_size = len(test_vector) if test_vector else 768
+        if is_debug_mode():
+            print(f"[DEBUG] [SemanticIndex] Creating collection '{collection_name}' with vector size {vector_size}.")
+        
         # Collection missing, create it
         payload = {
             "vectors": {
-                "size": 768,  # nomic-embed-text size
+                "size": vector_size,
                 "distance": "Cosine"
             }
         }
@@ -45,7 +51,7 @@ def scroll_active_points(collection_name: str) -> dict:
     next_page = None
     
     while True:
-        payload = {"limit": 100, "with_payload": ["hash", "path"]}
+        payload = {"limit": 100, "with_payload": ["hash", "path", "symbol"]}
         if next_page:
             payload["offset"] = next_page
             
@@ -57,7 +63,8 @@ def scroll_active_points(collection_name: str) -> dict:
             for point in data.get("points", []):
                 points[point["id"]] = {
                     "hash": point.get("payload", {}).get("hash"),
-                    "path": point.get("payload", {}).get("path")
+                    "path": point.get("payload", {}).get("path"),
+                    "symbol": point.get("payload", {}).get("symbol")
                 }
             next_page = data.get("next_page_offset")
             if not next_page:
@@ -67,20 +74,30 @@ def scroll_active_points(collection_name: str) -> dict:
             
     return points
 
-def get_ollama_embedding(text: str) -> list:
-    """Retrieves embedding vector from the local Ollama API."""
+def get_ollama_embedding(text: str, task: str = "document") -> list:
+    """Retrieves embedding vector from the local Ollama API, appending the correct task prefix."""
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
     model = config.get("EMBEDDING_MODEL", "nomic-embed-text")
+    timeout = config.get("EMBEDDING_TIMEOUT", 30.0)
+    max_chars = config.get("EMBEDDING_MAX_CHARS", 6000)
     url = f"{ollama_host}/api/embeddings"
     
+    # Client-side truncation to prevent "the input length exceeds the context length" Ollama 500 errors
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        
+    prefix = "search_document: " if task == "document" else "search_query: "
+    full_prompt = f"{prefix}{text}"
+    
     try:
-        r = requests.post(url, json={"model": model, "prompt": text}, timeout=15)
+        r = requests.post(url, json={"model": model, "prompt": full_prompt}, timeout=timeout)
         if r.status_code == 200:
             return r.json().get("embedding", [])
+        else:
+            print(f"[SemanticIndex] Warning: Embedding request failed with status {r.status_code}: {r.text}")
     except Exception as e:
-        if is_debug_mode():
-            print(f"[DEBUG] [SemanticIndex] Failed to get Ollama embedding: {e}")
+        print(f"[SemanticIndex] Error generating embedding vector: {e}")
     return []
 
 def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: dict, dependency_graph: dict, changed_files: list):
@@ -128,7 +145,7 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
         code_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         
         # Incremental check
-        if symbol_uuid in existing_vectors and existing_vectors[symbol_uuid]["hash"] == code_hash:
+        if symbol_uuid in existing_vectors and existing_vectors[symbol_uuid]["hash"] == code_hash and existing_vectors[symbol_uuid].get("symbol") is not None:
             continue
 
         updates.append({
@@ -145,7 +162,7 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
         
         def process_update(u):
             context_text = f"Path: {u['meta']['file_path']}\nSymbol: {u['qual_name']}\nType: {u['meta'].get('type', 'symbol')}\nCode:\n{u['content']}"
-            vector = get_ollama_embedding(context_text)
+            vector = get_ollama_embedding(context_text, task="document")
             if vector:
                 return {
                     "id": u["uuid"],
@@ -171,11 +188,18 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
         if points_to_upsert:
             qdrant_host = get_config().get("QDRANT_HOST", "http://localhost:6333")
             upsert_url = f"{qdrant_host}/collections/{collection_name}/points"
-            try:
-                requests.put(upsert_url, json={"points": points_to_upsert}, timeout=15)
-                print(f"[SemanticIndex] Successfully upserted {len(points_to_upsert)} points.")
-            except Exception as e:
-                print(f"[SemanticIndex] Failed to upload points: {e}")
+            batch_size = 500
+            total_batches = (len(points_to_upsert) + batch_size - 1) // batch_size
+            for i in range(0, len(points_to_upsert), batch_size):
+                batch = points_to_upsert[i:i + batch_size]
+                try:
+                    r = requests.put(upsert_url, json={"points": batch}, timeout=15)
+                    if r.status_code == 200:
+                        print(f"[SemanticIndex] Successfully upserted batch {i // batch_size + 1}/{total_batches} ({len(batch)} points).")
+                    else:
+                        print(f"[SemanticIndex] Error: Failed to upsert batch {i // batch_size + 1}/{total_batches}. Status code {r.status_code}: {r.text}")
+                except Exception as e:
+                    print(f"[SemanticIndex] Failed to upload batch {i // batch_size + 1}/{total_batches}: {e}")
 
     # Prune ONLY stale symbols belonging to the active files we evaluated
     stale_uuids = [
@@ -193,11 +217,17 @@ def sync_semantic_index(owner: str, repo: str, commit_sha: str, symbol_index: di
 
 def search_semantic(query_text: str, collection_name: str, limit: int = 3) -> list:
     """Queries Qdrant for closely matched code blocks using nomic-embed-text."""
-    query_vector = get_ollama_embedding(query_text)
+    if is_debug_mode():
+        print(f"[DEBUG] [SemanticIndex] Querying semantic search for collection: '{collection_name}' (limit: {limit}). Query prefix: '{query_text[:60].strip()}...'")
+    query_vector = get_ollama_embedding(query_text, task="query")
     if not query_vector:
+        if is_debug_mode():
+            print(f"[DEBUG] [SemanticIndex] Query embedding generation failed or returned empty.")
         return []
 
-    qdrant_host = get_config().get("QDRANT_HOST", "http://localhost:6333")
+    config = get_config()
+    score_threshold = config.get("SEMANTIC_SCORE_THRESHOLD", 0.30)
+    qdrant_host = config.get("QDRANT_HOST", "http://localhost:6333")
     url = f"{qdrant_host}/collections/{collection_name}/points/search"
     payload = {
         "vector": query_vector,
@@ -207,7 +237,17 @@ def search_semantic(query_text: str, collection_name: str, limit: int = 3) -> li
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            return r.json().get("result", [])
+            results = r.json().get("result", [])
+            if is_debug_mode():
+                print(f"[DEBUG] [SemanticIndex] Qdrant search returned {len(results)} matches.")
+                for idx, res in enumerate(results):
+                    print(f"[DEBUG] [SemanticIndex] Match #{idx}: Symbol='{res.get('payload', {}).get('symbol')}', Score={res.get('score', 0.0):.4f}, Payload={res.get('payload')}")
+            filtered_results = [res for res in results if res.get("score", 0.0) >= score_threshold]
+            if is_debug_mode():
+                print(f"[DEBUG] [SemanticIndex] Filtered down to {len(filtered_results)} matches above threshold {score_threshold}.")
+            return filtered_results
+        else:
+            print(f"[SemanticIndex] Warning: Qdrant search returned status code {r.status_code}: {r.text}")
     except Exception as e:
         if is_debug_mode():
             print(f"[DEBUG] [SemanticIndex] Search request failed: {e}")

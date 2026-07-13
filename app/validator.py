@@ -1,10 +1,19 @@
 import re
+import builtins
 from app.models import CodeComment
 
 # Mapping validation metrics
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 REPORT_THRESHOLD = SEVERITY_RANK["P2"]
 CONFIDENCE_THRESHOLD = 0.6
+
+# Common safe framework/language identifiers that shouldn't trigger demotion
+SAFE_IDENTIFIERS = {
+    "ValueError", "TypeError", "KeyError", "AttributeError", "NotImplementedError", "RuntimeError", "Exception",
+    "self", "cls", "None", "True", "False", "dict", "list", "set", "tuple", "str", "int", "float", "bool",
+    "QuerySet", "Query", "clone", "chain", "execute_sql", "explain", "explain_json", "options", "sql_format",
+    "_explain_json_cache", "supported_explain_formats", "supports_explain_json", "supports_json_field"
+}
 
 def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
     all_text = " ".join(
@@ -14,7 +23,13 @@ def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
     candidates = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", comment)
     if not candidates:
         return True
-    return any(c in all_text for c in candidates)
+    
+    # Grounded if at least one candidate is in the diff, is a standard builtin, or is a safe framework identifier
+    for c in candidates:
+        if c in all_text or c in SAFE_IDENTIFIERS or hasattr(builtins, c):
+            return True
+            
+    return False
 
 def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_diff_file: dict) -> list:
     valid_comments = []

@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from app.config import get_config, is_debug_mode
 
@@ -95,11 +96,13 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
     config = get_config()
     token_budget = config.get("DEP_TOKEN_BUDGET", 5000)
     
-    # Reconstruct the file's diff text safely to verify references
-    diff_text = " ".join(
-        list(parsed_diff.get("added_lines", {}).values()) + 
-        list(parsed_diff.get("context_lines", {}).values())
-    )
+    # Reconstruct the file's diff text safely, capturing context, added, and deleted lines
+    diff_lines = []
+    for hunk in parsed_diff.get("hunks", []):
+        for line_info in hunk.get("lines", []):
+            if len(line_info) >= 4:
+                diff_lines.append(line_info[3])
+    diff_text = "\n".join(diff_lines)
     
     # Find all symbols defined inside the file under review
     local_symbols = [name for name, info in symbol_index.items() if info["file_path"] == filepath]
@@ -117,6 +120,8 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
     # BFS lookup for neighbors up to max_hops
     candidate_neighbors = get_symbol_neighbors_bfs(db_path, local_symbols, max_hops=max_hops)
     
+    EXCLUDED_SEGMENTS = {"py", "js", "ts", "go", "rs", "java", "cpp", "app", "src", "tests", "lib", "utils", "helper", "helpers"}
+    
     for neighbor_sym in candidate_neighbors:
         if (accumulated_chars / 4) >= token_budget:
             break
@@ -124,9 +129,20 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
         if neighbor_sym in retrieved_symbols or neighbor_sym in local_symbols:
             continue
             
-        # Filter: only pull the symbol's body if it is referenced inside the diff text
+        # Parse non-generic parts of the qualified name (directory names, module names, class namespaces)
+        qual_parts = [p for p in re.split(r'::|/|\.', neighbor_sym) if p and p.lower() not in EXCLUDED_SEGMENTS and len(p) > 2]
         simple_name = neighbor_sym.split("::")[-1]
-        if simple_name not in diff_text:
+        
+        referenced = False
+        if simple_name in diff_text:
+            referenced = True
+        else:
+            for part in qual_parts:
+                if part in diff_text:
+                    referenced = True
+                    break
+                    
+        if not referenced:
             continue
             
         if neighbor_sym in symbol_index:

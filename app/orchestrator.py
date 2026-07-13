@@ -3,9 +3,9 @@ import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from app.models import SubagentResponse, CodeComment
+from app.models import SubagentResponse, SubagentResponseOllama, CodeComment
 from app.llm_client import call_gemini, call_local_llm
-from app.prompt_builder import build_subagent_system_instruction
+from app.prompt_builder import build_subagent_system_instruction, build_subagent_system_instruction_ollama
 from app.chunker import get_symbol_signature_or_content
 from app.config import get_config, is_debug_mode
 from app.profiler import PipelineProfiler
@@ -21,18 +21,37 @@ pattern-matcher could catch.
 
 SUBAGENT_PROMPTS = {
     "Architecture": (
-        "Focus ONLY on file/module decoupling, leaky abstractions, interface "
-        "boundary violations broken by this diff, and design patterns misapplied. "
-        "Ignore naming, import order, or anything formatting-adjacent."
+        "Focus on file/module decoupling, leaky abstractions, interface boundary violations, "
+        "and misapplied design patterns. Specifically audit for:\n"
+        "1. **Immutability & Chaining Patterns:** In query-builder or fluent APIs, ensure methods "
+        "always clone or chain (e.g., return copies) instead of mutating state (like `self` or `self.query`) in-place. "
+        "In-place mutation can leak internal parameters (e.g., execution plans, explain details) across subsequent executions.\n"
+        "2. **Backend & Capability Abstractions:** Verify that newly introduced feature flags (e.g., `supports_explain_json`) "
+        "are actually respected and checked consistently across backend integrations, rather than being ignored or bypassed. "
+        "Ensure base class features are not keyed off unrelated flags (e.g., keying explain structures off a general model JSON field support flag like `supports_json_field` is a leaky abstraction).\n"
+        "3. **Decoupling and Contract Drift:** Watch out for base classes making hardcoded assumptions about "
+        "subclass behavior, or documentation overstating backend support contracts."
     ),
     "Logic": (
-        "Focus ONLY on loop bounds, off-by-one errors, state management bugs, "
-        "race conditions, and algorithmic correctness given the visible diff. "
-        "Do not comment on types -- pyright already verified those."
+        "Focus on correctness, edge cases, error handling, thread safety, and memory efficiency. Specifically audit for:\n"
+        "1. **Python-Specific Antipatterns & Concurrency:**\n"
+        "   - **Mutable Default Arguments:** Never use mutable defaults (e.g., `options={}`) in method/function signatures.\n"
+        "   - **Shared Class/Module-Level Mutable State:** Do not store shared caches or dicts at the class level (e.g., `_explain_json_cache = {}` on the class). "
+        "This is not thread-safe and leaks data across concurrent database connections, queries, or parallel test runs.\n"
+        "   - **Reference Leakage of Cache Content:** Avoid returning cached objects directly by reference if they can be mutated. Callers "
+        "modifying the returned data will pollute subsequent lookups. Clone or return deep copies.\n"
+        "2. **Strict API & Exception Consistency:** Ensure exceptions match existing API conventions. If existing methods raise `ValueError` for invalid parameters, "
+        "new methods must not raise generic `TypeError` or `KeyError` for the same parameter issues.\n"
+        "3. **Execution Logic & Edge Cases:**\n"
+        "   - **Early Exits & Validation:** Ensure special-case handlers (like empty/none querysets) do not bypass parameter validation (e.g., check format correctness before returning early).\n"
+        "   - **Index/Key Safety:** Guard against assumptions of existence. Never assume `rows[0][0]` or `data[0]` exists without checking if the collection is non-empty.\n"
+        "   - **Eager vs. Lazy Resource Usage:** Avoid forcing immediate evaluation of streams/generators (like wrapping inside `list(...)`) if lazy yielding is possible, as eager collection causes high memory overhead."
     ),
     "Security": (
-        "Focus ONLY on runtime security issues such as access bypasses, "
-        "authentication bypasses, privilege escalations, and severe logical vulnerabilities."
+        "Focus strictly on security boundaries, input sanitization, logical access bypasses, "
+        "SQL/command injection, and privilege escalation. Ensure execution parameters or options are "
+        "never executed directly or interpolated unsafely. Ensure any caching structure does not "
+        "leak sensitive data across distinct user sessions or system boundaries."
     )
 }
 
@@ -209,6 +228,8 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
     owner = _context.get("owner")
     repo = _context.get("repo")
     if not (owner and repo and symbol_index):
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Proactive context lookup skipped: owner='{owner}', repo='{repo}', symbol_index_len={len(symbol_index) if symbol_index else 0}")
         return ""
         
     collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_")
@@ -216,6 +237,8 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
         from app.semantic_index import search_semantic
         # Safety Truncation: Prevents massive diff payloads from exceeding model embedding context limits
         truncated_query = query_text[:8000]
+        if is_debug_mode():
+            print(f"[DEBUG] [Orchestrator] Running proactive semantic search on collection '{collection_name}'...")
         matches = search_semantic(truncated_query, collection_name, limit=limit)
         semantic_lines = []
         
@@ -229,22 +252,31 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
                     cache.add(m_qual, m_meta, m_body)
                 
                 semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
+                if is_debug_mode():
+                    print(f"[DEBUG] [Orchestrator] Added proactive semantic match: '{m_qual}'")
                 
-                # 1-hop Graph Expansion on the semantic match to surface structural relevance
+                # 1-hop Graph Expansion on the semantic match
                 neighbors = get_symbol_neighbors(db_path, m_qual, max_hops=1)
-                for caller in neighbors["callers"][:2]:  # Limit to avoid bloating token budget
+                for caller in neighbors["callers"][:2]: # Limit to prevent bloating the token space
                     if caller in symbol_index and not cache.contains(caller):
                         n_meta = symbol_index[caller]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(caller, n_meta, n_body)
                         semantic_lines.append(f"  └─ Caller of match '{caller}': {n_body}")
+                        if is_debug_mode():
+                            print(f"[DEBUG] [Orchestrator]   └─ Added caller neighbor: '{caller}'")
                         
-                for callee in neighbors["callees"][:2]:  # Limit to avoid bloating token budget
+                for callee in neighbors["callees"][:2]: # Limit to prevent bloating the token space
                     if callee in symbol_index and not cache.contains(callee):
                         n_meta = symbol_index[callee]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(callee, n_meta, n_body)
                         semantic_lines.append(f"  └─ Callee of match '{callee}': {n_body}")
+                        if is_debug_mode():
+                            print(f"[DEBUG] [Orchestrator]   └─ Added callee neighbor: '{callee}'")
+            else:
+                if is_debug_mode() and m_qual:
+                    print(f"[DEBUG] [Orchestrator] Semantic match '{m_qual}' not found in active symbol_index.")
                 
         if semantic_lines:
             return "\n--- PROACTIVE SEMANTIC DISCOVERIES & EXPANDED GRAPH CONTEXT ---\n" + "\n".join(semantic_lines)
@@ -252,6 +284,16 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
         if is_debug_mode():
             print(f"[DEBUG] [Orchestrator] Proactive semantic lookups bypassed: {e}")
     return ""
+
+def _strip_code_fences(raw_out: str) -> str:
+    cleaned = raw_out.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
 
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
     if is_debug_mode():
@@ -262,33 +304,72 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     config = get_config()
     baseline = STATIC_ANALYSIS_BASELINE if config.get("ENABLE_STATIC_BASELINE", True) else ""
     
-    role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
-    prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
-    
-    # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes
     backend = config.get("LLM_BACKEND", "gemini")
+    base_prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
+    
     if backend == "ollama":
-        raw_out = call_local_llm(prompt, role_instruction, SubagentResponse)
+        # Ollama-only path: reasoning-first schema, tailored prompt with few-shot
+        # examples, and a bounded retry loop with corrective feedback.
+        role_instruction = build_subagent_system_instruction_ollama(role, role_focus, conventions_text, baseline)
+        max_retries = int(config.get("MAX_LOCAL_PARSE_RETRIES", 2))
+        prompt = base_prompt
+        last_error = None
+        last_raw = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                raw_out = call_local_llm(prompt, role_instruction, SubagentResponseOllama)
+                last_raw = raw_out
+                cleaned = _strip_code_fences(raw_out)
+                data = json.loads(cleaned)
+                
+                # Parse into the canonical SubagentResponse. The 'reasoning' field
+                # is safely ignored thanks to pydantic's default extra="ignore" strategy.
+                resp = SubagentResponse(**data)
+                
+                if is_debug_mode():
+                    print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
+                    print(raw_out, flush=True)
+                    print("-"*98 + "\n", flush=True)
+                    print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
+                    
+                return resp
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    print(f"[Orchestrator] [Ollama] Subagent '{role}' returned invalid output on attempt {attempt+1}/{max_retries+1} "
+                          f"({type(e).__name__}: {e}). Retrying with corrective feedback.", flush=True)
+                    correction = (
+                        f"\n\n--- YOUR PREVIOUS RESPONSE WAS INVALID ---\n"
+                        f"Error: {e}\n"
+                        f"Previous output (truncated to 1000 chars):\n{(last_raw or '')[:1000]}\n"
+                        f"Fix this. Return ONLY a single valid JSON object matching the schema exactly, "
+                        f"with 'reasoning' as the first key, grounded in the actual diff content below.\n"
+                    )
+                    prompt = base_prompt + correction
+                    continue
+                
+                # Retries exhausted: degrade gracefully so we don't crash the entire pipeline
+                print(f"[Orchestrator] [Ollama] Subagent '{role}' failed after {max_retries+1} attempts "
+                      f"({type(e).__name__}: {last_error}). Falling back to empty SUCCESS result.", flush=True)
+                return SubagentResponse(status="SUCCESS", findings=[])
     else:
+        role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
+        prompt = base_prompt
+        
+        # Propagate exception up directly (No Swallow) to prevent silent failures on Gemini
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
         
-    cleaned = raw_out.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    
-    resp = SubagentResponse(**json.loads(cleaned.strip()))
-    
-    if is_debug_mode():
-        print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
-        print(raw_out, flush=True)
-        print("-"*98 + "\n", flush=True)
-        print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
+        cleaned = _strip_code_fences(raw_out)
+        resp = SubagentResponse(**json.loads(cleaned))
         
-    return resp
+        if is_debug_mode():
+            print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
+            print(raw_out, flush=True)
+            print("-"*98 + "\n", flush=True)
+            print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
+            
+        return resp
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
     system_inst = "You are a code symbol mapping router. Match requested vague expressions to exact symbol paths."
@@ -331,12 +412,11 @@ def crg_search_symbols(db_path: str, query: str, limit: int = 10) -> list:
 def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_index: dict, db_path: str, cache: SharedContextCache, max_rounds: int = 1) -> list:
     """
     Consolidated multi-pass loop orchestrator. Loops dynamically through context escalations,
-    resolving symbol and semantic query requests up to max_rounds [3].
+    resolving symbol and semantic query requests up to max_rounds.
     """
     profiler = PipelineProfiler()
     roles = ["Architecture", "Logic", "Security"]
     
-    # Parity parallelization logic to protect Ollama CPU limits [3]
     backend = get_config().get("LLM_BACKEND", "gemini")
     
     profiler.start("Orchestrator: Pass 1 LLM Reviews")
@@ -392,7 +472,6 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
     repo = _context.get("repo")
     collection_name = f"{owner}_{repo}".lower().replace("-", "_").replace(".", "_") if (owner and repo) else ""
 
-    # Dynamic multi-round escalation loop (Stage 2)
     while (escalated_symbols or semantic_queries_map) and escalated_roles and round_idx < max_rounds:
         profiler.start(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
         newly_retrieved_context = []
@@ -462,6 +541,7 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
                         
                     newly_retrieved_context.append(f"--- Symbol Deletion Notice ({sym}) ---\n{err_msg}")
 
+        # FIXED: Dedented this section outside the `for sym in escalated_symbols:` loop.
         augmented = "\n\n".join(newly_retrieved_context)
         payload = f"{payload}\n\n--- Escalated Resolved Context (Pass {round_idx + 2}) ---\n{augmented}"
         profiler.stop(f"Orchestrator: Escalation AST DB Resolving Round {round_idx + 1}")
@@ -516,7 +596,7 @@ def run_escalation_rounds(chunk_payload: str, conventions_text: str, symbol_inde
             ))
     return final_comments
 
-def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventions_text: str, cache: SharedContextCache, db_path: str, dep_hops: int = 1, max_escalation_rounds: int = 1) -> list:
+def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventions_text: str, cache: SharedContextCache, db_path: str, dep_hops: int = 1, max_escalation_rounds: int = 1, parsed_diff: dict = None, filename: str = "", language: str = "") -> list:
     qual_name = changed_symbol["qualified_name"]
     populate_cache_for_symbol(db_path, qual_name, symbol_index, cache, dep_hops=dep_hops)
     neighbors = get_symbol_neighbors(db_path, qual_name, max_hops=dep_hops)
@@ -528,7 +608,16 @@ def orchestrate_symbol_review(changed_symbol: dict, symbol_index: dict, conventi
     if changed_code:
         proactive_context = get_proactive_semantic_context(changed_code, symbol_index, cache, db_path, limit=5)
         
+    diff_chunk = ""
+    if parsed_diff and filename:
+        from app.prompt_builder import chunk_file_diffs
+        chunks = chunk_file_diffs(filename, language, parsed_diff)
+        if chunks:
+            diff_chunk = f"\n\n--- UNIFIED PATCH/DIFF FOR THIS FILE ({filename}) ---\n" + "\n".join(chunks)
+
     chunk_payload = f"Changed Code Block: {changed_symbol['name']}\nRange: {changed_symbol['line_range']}\nKind: {changed_symbol['kind']}\n\n{symbol_bundle}"
+    if diff_chunk:
+        chunk_payload += diff_chunk
     if proactive_context:
         chunk_payload = f"{chunk_payload}\n{proactive_context}"
     
