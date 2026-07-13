@@ -1,3 +1,4 @@
+# ===== app/config.py =====
 
 import os
 import json
@@ -22,8 +23,8 @@ DEFAULT_CONFIG = {
     "OLLAMA_HOST": "http://localhost:11434",
     "OLLAMA_NUM_CTX_MIN": 4096,       # Floor for Ollama's context window (num_ctx).
                                       # Ensures prompts aren't silently truncated by small Ollama defaults.
-    "OLLAMA_NUM_CTX_MAX": 8192,       # Ceiling for num_ctx, calibrated for memory constraints with a 14B model.
-    "OLLAMA_NUM_PREDICT": 2048,       # Max output tokens per subagent call to prevent partial JSON truncation.
+    "OLLAMA_NUM_CTX_MAX": 16384,      # Increased ceiling from 8192 to 16384 to handle larger context bundles.
+    "OLLAMA_NUM_PREDICT": 4096,       # Output limit to ensure plenty of room for structured responses.
     "MAX_LOCAL_PARSE_RETRIES": 2,     # Retries for a single subagent call when Ollama returns invalid/truncated JSON.
     "QDRANT_HOST": "http://localhost:6333",
     "EMBEDDING_MODEL": "nomic-embed-text",

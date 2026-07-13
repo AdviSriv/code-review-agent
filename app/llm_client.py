@@ -89,7 +89,7 @@ def get_lines(file: str, start: int, end: int) -> str:
         return f"Error: File '{file}' not found locally or remote parameters missing."
     if get_config().get("LLM_BACKEND") == "ollama":
         return content
-    content_tokens = int(len(content) / 4)
+    content_tokens = int(len(content) / 2.2)
     if _gatekeeper_ref:
         profiler = PipelineProfiler()
         start_gatekeeper_wait = time.perf_counter()
@@ -175,24 +175,41 @@ def reset_token_stats():
         token_stats["candidates_tokens"] = 0
         token_stats["total_tokens"] = 0
 
-def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str:
+def call_local_llm(prompt: str, system_instruction: str, response_schema, num_predict_override: int = None) -> str:
     """Invokes local Ollama server chat API with structured format support and retry safety."""
     profiler = PipelineProfiler()
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
-    model = os.getenv("LLM_MODEL", "deepseek-r1:8b")  # Replaced default value with pulled model
+    model = os.getenv("LLM_MODEL", "deepseek-r1:8b")
 
-    # Ollama does NOT automatically infer context window from prompt length.
-    # Set explicit num_ctx options here to prevent silent front/back context truncation.
+    # Read base generation budget.
     num_predict = int(config.get("OLLAMA_NUM_PREDICT", 2048))
+
+    if "deepseek-r1" in model.lower():
+        num_predict = max(num_predict, 8192)
+
+    if num_predict_override is not None:
+        num_predict = max(num_predict, num_predict_override)
+
     ctx_floor = int(config.get("OLLAMA_NUM_CTX_MIN", 4096))
-    ctx_ceiling = int(config.get("OLLAMA_NUM_CTX_MAX", 8192))
+    ctx_ceiling = int(config.get("OLLAMA_NUM_CTX_MAX", 24576))  # was 16384
     
-    estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 4)
+    # Heuristic update: uses a realistic 2.2 character density to evaluate code prompts accurately [cl3]
+    estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 2.2)
     # Headroom for output generation and safety buffer, aligned to nearest 1024.
     needed_ctx = estimated_input_tokens + num_predict + 512
     needed_ctx = ((needed_ctx // 1024) + 1) * 1024
     num_ctx = max(ctx_floor, min(needed_ctx, ctx_ceiling))
+
+    # Foolproof safety net: if estimated_input_tokens exceeds safe ceiling,
+    # trim payload to prevent 400 Bad Request engine execution crashes [cl3].
+    safe_input_limit = num_ctx - num_predict - 256
+    if estimated_input_tokens > safe_input_limit and safe_input_limit > 0:
+        char_limit = int(safe_input_limit * 2.2)
+        if is_debug_mode():
+            print(f"[DEBUG] [Local LLM Client] Input prompt ({estimated_input_tokens} tokens) exceeds safe limit ({safe_input_limit} tokens). Truncating payload to {char_limit} chars.", flush=True)
+        prompt = prompt[:char_limit] + "\n\n[Prompt truncated to fit context budget]"
+        estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 2.2)
 
     if is_debug_mode() and needed_ctx > ctx_ceiling:
         print(f"[DEBUG] [Local LLM Client] Estimated prompt (~{estimated_input_tokens} tokens) plus output budget "
@@ -213,18 +230,13 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
         "stream": False
     }
     
+    # Ollama 0.31.1 thinking mode configuration. We pass the native think option [cl1.1.2].
+    if "deepseek-r1" in model.lower():
+        payload["think"] = True # Separate thinking channel [cl1.1.2]
+        
     if response_schema is not None:
-        # DeepSeek-R1 models use reasoning traces (<think> tags).
-        # Passing a JSON schema constraint to Ollama's 'format' parameter uses GBNF grammars
-        # which force JSON from token 1, completely blocking the <think> tag and disabling R1's reasoning.
-        # Bypass 'format' constraint for deepseek-r1 to let it reason naturally,
-        # and rely on our robust regex parser in orchestrator.py to extract JSON.
-        if "deepseek-r1" in model.lower():
-            if is_debug_mode():
-                print("[DEBUG] [Local LLM Client] DeepSeek-R1 detected. Bypassing Ollama 'format' constraint to enable reasoning (<think> tags).", flush=True)
-        else:
-            raw_schema = response_schema.model_json_schema()
-            payload["format"] = simplify_schema_for_local_llm(raw_schema)
+        raw_schema = response_schema.model_json_schema()
+        payload["format"] = simplify_schema_for_local_llm(raw_schema)
         
     if is_debug_mode():
         print("\n" + "="*40 + " OLLAMA LOCAL PROMPT " + "="*40, flush=True)
@@ -241,7 +253,9 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     
     for attempt in range(max_retries):
         try:
-            r = requests.post(url, json=payload, timeout=120)
+            # Upgraded HTTP timeout from 120s to 600s (10 minutes) to cleanly accommodate
+            # deep CPU thinking phases without triggering connection timeouts [cl1]
+            r = requests.post(url, json=payload, timeout=600)
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama returned status code {r.status_code}: {r.text}")
             response_data = r.json()
@@ -257,7 +271,13 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
                 raise e
     profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
     
+    # Read thinking trace separately [cl1.1.2]
     content = response_data.get("message", {}).get("content", "")
+    thinking_trace = response_data.get("message", {}).get("thinking", "")
+    
+    if is_debug_mode() and thinking_trace:
+         print(f"\n[DEBUG] [Ollama] Native Thinking Trace Separated:\n{thinking_trace}\n", flush=True)
+         
     done_reason = response_data.get("done_reason")
     
     prompt_tokens = response_data.get("prompt_eval_count", 0)
@@ -313,7 +333,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         pass
     else:
         # Standardize rate limit consumption check across all types of API requests
-        prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
+        prompt_tokens = int((len(prompt) + len(system_instruction)) / 2.2)
         if _gatekeeper_ref:
             start_gatekeeper_wait = time.perf_counter()
             while True:

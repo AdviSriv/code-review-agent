@@ -1,3 +1,5 @@
+# ===== app/prompt_builder.py =====
+
 from typing import List
 
 def build_subagent_system_instruction(role: str, role_focus: str = "", conventions_text: str = "", static_baseline: str = "") -> str:
@@ -78,12 +80,6 @@ def build_subagent_system_instruction_ollama(role: str, role_focus: str = "", co
     Ollama-only variant of build_subagent_system_instruction, tailored to smaller
     locally-hosted models (e.g. qwen2.5-coder) running under grammar-constrained
     structured output.
-    
-    1. Describes the `reasoning` field that must come first in the JSON object
-       (see models.SubagentResponseOllama) and explains it is scratch space for
-       thinking BEFORE committing to a status, not a place to summarize the code.
-    2. Includes two concrete worked examples (SUCCESS-with-finding and
-       NEEDS_CONTEXT) so the model has a clear template to follow.
     """
     instruction = f"""
 You are a critical code reviewer.
@@ -126,15 +122,8 @@ IMPORTANT FOR 'context_request' FIELD:
 - If status is "SUCCESS", "context_request" MUST be null. Do not fill it with text or queries.
 - If status is "NEEDS_CONTEXT", populate "context_request" with the exact symbols, classes, functions, or semantic queries you need.
 
-THE 'reasoning' FIELD COMES FIRST IN YOUR OUTPUT. USE IT TO THINK BEFORE YOU DECIDE:
-- Walk through the ACTUAL diff content you were given below, line by line where relevant, against your role's focus areas.
-- Name the specific diff position(s) you are looking at. Say explicitly what you checked and either found wrong or ruled out.
-- Do NOT use 'reasoning' to describe what the code does in general, summarize the file, or restate the prompt. That is not analysis and produces useless output.
-- Everything you conclude in 'reasoning' must be reflected consistently in 'status'/'findings'/'context_request' — do not contradict yourself between fields.
-
 Structure response strictly as a single JSON object matching this schema, in this exact key order. No markdown outside:
 {{
-  "reasoning": "string (your step-by-step analysis of THIS diff chunk, written first)",
   "status": "string ('SUCCESS' or 'NEEDS_CONTEXT')",
   "findings": [
     {{
@@ -157,7 +146,6 @@ Structure response strictly as a single JSON object matching this schema, in thi
 
 WORKED EXAMPLE 1 (a real issue was found, no extra context needed):
 {{
-  "reasoning": "Position DP:14 changes the default argument of update() from options=None to options={{}}. This is a mutable default argument — every call that doesn't pass options will share the same dict across invocations, so a caller that mutates it will leak state into later calls. I have the full function body shown, so I don't need to escalate for more context. Nothing else in this chunk raises a concern I can point to specific diff content for.",
   "status": "SUCCESS",
   "findings": [
     {{
@@ -174,7 +162,6 @@ WORKED EXAMPLE 1 (a real issue was found, no extra context needed):
 
 WORKED EXAMPLE 2 (a test assertion changed and the tested function's implementation is not shown, so context is required):
 {{
-  "reasoning": "Position DP:8 deletes the assertion `assert result.status == 'ok'` from test_submit_order and replaces it with `assert result.status in ('ok', 'pending')`. This loosens what the test guarantees. I do not have the implementation of `submit_order` in the context I was given, so per the escalation protocol I cannot verify whether this loosening reflects a real, intentional new code path or is silently masking a regression. I need to see `submit_order` before I can decide.",
   "status": "NEEDS_CONTEXT",
   "findings": [],
   "context_request": {{

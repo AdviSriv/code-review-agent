@@ -5,10 +5,14 @@ import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from app.models import SubagentResponse, SubagentResponseOllama, CodeComment
+from app.models import SubagentResponse, CodeComment
 from app.llm_client import call_gemini, call_local_llm
-from app.prompt_builder import build_subagent_system_instruction, build_subagent_system_instruction_ollama
+from app.prompt_builder import (
+    build_subagent_system_instruction, 
+    build_subagent_system_instruction_ollama
+)
 from app.chunker import get_symbol_signature_or_content
+from app.llm_client import OllamaTruncatedResponseError
 from app.config import get_config, is_debug_mode
 from app.profiler import PipelineProfiler
 
@@ -38,12 +42,9 @@ SUBAGENT_PROMPTS = {
         "Focus on correctness, edge cases, error handling, thread safety, and memory efficiency. Specifically audit for:\n"
         "1. **Python-Specific Antipatterns & Concurrency:**\n"
         "   - **Mutable Default Arguments:** Never use mutable defaults (e.g., `options={}`) in method/function signatures.\n"
-        "   - **Shared Class/Module-Level Mutable State:** Do not store shared caches or dicts at the class level (e.g., `_explain_json_cache = {}` on the class). "
-        "This is not thread-safe and leaks data across concurrent database connections, queries, or parallel test runs.\n"
-        "   - **Reference Leakage of Cache Content:** Avoid returning cached objects directly by reference if they can be mutated. Callers "
-        "modifying the returned data will pollute subsequent lookups. Clone or return deep copies.\n"
-        "2. **Strict API & Exception Consistency:** Ensure exceptions match existing API conventions. If existing methods raise `ValueError` for invalid parameters, "
-        "new methods must not raise generic `TypeError` or `KeyError` for the same parameter issues.\n"
+        "   - **Shared Class/Module-Level Mutable State:** Do not store shared caches or dicts at the class level (e.g., `_explain_json_cache = {}` on the class). This is not thread-safe and leaks data across concurrent database connections, queries, or parallel test runs.\n"
+        "   - **Reference Leakage of Cache Content:** Avoid returning cached objects directly by reference if they can be mutated. Callers modifying the returned data will pollute subsequent lookups. Clone or return deep copies.\n"
+        "2. **Strict API & Exception Consistency:** Ensure exceptions match existing API conventions. If existing methods raise `ValueError` for invalid parameters, new methods must not raise generic `TypeError` or `KeyError` for the same parameter issues.\n"
         "3. **Execution Logic & Edge Cases:**\n"
         "   - **Early Exits & Validation:** Ensure special-case handlers (like empty/none querysets) do not bypass parameter validation (e.g., check format correctness before returning early).\n"
         "   - **Index/Key Safety:** Guard against assumptions of existence. Never assume `rows[0][0]` or `data[0]` exists without checking if the collection is non-empty.\n"
@@ -244,38 +245,70 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
         matches = search_semantic(truncated_query, collection_name, limit=limit)
         semantic_lines = []
         
+        accumulated_semantic_chars = 0
+        # Strict context pruning budget (approx 1500 tokens) to guarantee context bounds
+        semantic_char_budget = 6000 
+        
         for match in matches:
+            if accumulated_semantic_chars >= semantic_char_budget:
+                if is_debug_mode():
+                    print("[DEBUG] [Orchestrator] Proactive semantic context budget exceeded. Truncating further discoveries.")
+                break
+                
             payload_data = match.get("payload", {})
             m_qual = payload_data.get("symbol")
             if m_qual and m_qual in symbol_index:
                 m_meta = symbol_index[m_qual]
+                is_class = m_meta.get("type") == "class"
+                
                 if not cache.contains(m_qual):
-                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
+                    # Force fallback_only=True (signature only) for classes to avoid loading massive class bodies
+                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=is_class)
                     cache.add(m_qual, m_meta, m_body)
                 
-                semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
+                match_payload = f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}"
+                
+                if accumulated_semantic_chars + len(match_payload) > semantic_char_budget:
+                    # Fallback to signature only (first line)
+                    m_sig = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=True)
+                    match_payload = f"\nSemantically Related Pattern Code Signature '{m_qual}':\n{m_sig}"
+                    if accumulated_semantic_chars + len(match_payload) > semantic_char_budget:
+                        continue
+                
+                semantic_lines.append(match_payload)
+                accumulated_semantic_chars += len(match_payload)
                 if is_debug_mode():
                     print(f"[DEBUG] [Orchestrator] Added proactive semantic match: '{m_qual}'")
                 
                 # 1-hop Graph Expansion on the semantic match
                 neighbors = get_symbol_neighbors(db_path, m_qual, max_hops=1)
                 for caller in neighbors["callers"][:2]: # Limit to prevent bloating the token space
+                    if accumulated_semantic_chars >= semantic_char_budget:
+                        break
                     if caller in symbol_index and not cache.contains(caller):
                         n_meta = symbol_index[caller]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(caller, n_meta, n_body)
-                        semantic_lines.append(f"  └─ Caller of match '{caller}': {n_body}")
-                        if is_debug_mode():
-                            print(f"[DEBUG] [Orchestrator]   └─ Added caller neighbor: '{caller}'")
+                        neighbor_payload = f"  └─ Caller of match '{caller}': {n_body}"
+                        if accumulated_semantic_chars + len(neighbor_payload) <= semantic_char_budget:
+                            semantic_lines.append(neighbor_payload)
+                            accumulated_semantic_chars += len(neighbor_payload)
+                            if is_debug_mode():
+                                print(f"[DEBUG] [Orchestrator]   └─ Added caller neighbor: '{caller}'")
                         
                 for callee in neighbors["callees"][:2]: # Limit to prevent bloating the token space
+                    if accumulated_semantic_chars >= semantic_char_budget:
+                        break
                     if callee in symbol_index and not cache.contains(callee):
                         n_meta = symbol_index[callee]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(callee, n_meta, n_body)
-                        semantic_lines.append(f"  └─ Callee of match '{callee}': {n_body}")
-                        if is_debug_mode():
-                            print(f"[DEBUG] [Orchestrator]   └─ Added callee neighbor: '{callee}'")
+                        neighbor_payload = f"  └─ Callee of match '{callee}': {n_body}"
+                        if accumulated_semantic_chars + len(neighbor_payload) <= semantic_char_budget:
+                            semantic_lines.append(neighbor_payload)
+                            accumulated_semantic_chars += len(neighbor_payload)
+                            if is_debug_mode():
+                                print(f"[DEBUG] [Orchestrator]   └─ Added callee neighbor: '{callee}'")
             else:
                 if is_debug_mode() and m_qual:
                     print(f"[DEBUG] [Orchestrator] Semantic match '{m_qual}' not found in active symbol_index.")
@@ -326,20 +359,28 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
         # but nonsensical response) must NOT crash the whole PR review — it should
         # be retried, and if still failing, degrade to an empty SUCCESS result for
         # just this one role/chunk so every other task still gets reviewed and posted.
+        
+        # Passes the rich, original conventions directly [cl2]
         role_instruction = build_subagent_system_instruction_ollama(role, role_focus, conventions_text, baseline)
         max_retries = int(config.get("MAX_LOCAL_PARSE_RETRIES", 2))
         prompt = base_prompt
         last_error = None
-        last_raw = None
 
+
+        predict_budget = None  # let call_local_llm use its normal default on attempt 0
+        
         for attempt in range(max_retries + 1):
             try:
-                raw_out = call_local_llm(prompt, role_instruction, SubagentResponseOllama)
-                last_raw = raw_out
+                # Active Instruction Pruning: Switch to a hyper-compact system instruction on retries [cl1].
+                # This drops the input token overhead by ~3,000+ tokens on attempts 2 and 3, completely
+                # preventing compounding context-shrinking failures on subsequent runs [cl1, cl3].
+                active_instruction = role_instruction if attempt == 0 else "Return strictly formatted JSON matching the response schema."
+                
+                # We pass the standard SubagentResponse schema (which lacks the 'reasoning' field)
+                # so that Ollama strictly structures the final content channel to status, findings, context_request [cl1.1.2].
+                raw_out = call_local_llm(prompt, active_instruction, SubagentResponse, num_predict_override=predict_budget)
                 cleaned = _strip_code_fences(raw_out)
                 data = json.loads(cleaned)
-                # Always parse into the canonical SubagentResponse. The Ollama-only
-                # 'reasoning' key is simply ignored (pydantic extra="ignore" default).
                 resp = SubagentResponse(**data)
 
                 if is_debug_mode():
@@ -352,17 +393,24 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
-                    print(f"[Orchestrator] [Ollama] Subagent '{role}' returned invalid output on attempt {attempt+1}/{max_retries+1} "
-                          f"({type(e).__name__}: {e}). Retrying with corrective feedback.", flush=True)
-                    correction = (
-                        f"\n\n--- YOUR PREVIOUS RESPONSE WAS INVALID ---\n"
-                        f"Error: {e}\n"
-                        f"Previous output (truncated to 1000 chars):\n{(last_raw or '')[:1000]}\n"
-                        f"Fix this. Return ONLY a single valid JSON object matching the schema exactly, "
-                        f"with 'reasoning' as the first key, grounded in the actual diff content below.\n"
-                    )
+                    if isinstance(e, OllamaTruncatedResponseError):
+                        # Truncation means the model ran out of room to think AND answer.
+                        # Grow the completion budget instead of just shrinking the prompt.
+                        predict_budget = int((predict_budget or 8192) * 1.5)
+                        predict_budget = min(predict_budget, 24000)  # sane ceiling
+                        correction = (
+                            f"\n\n--- PREVIOUS RESPONSE WAS TRUNCATED ---\n"
+                            f"Keep your reasoning brief and go straight to the JSON object.\n"
+                        )
+                    else:
+                        correction = (
+                            f"\n\n--- PREVIOUS RESPONSE FAILED PARSING ---\n"
+                            f"Error: {type(e).__name__}: {str(e)[:150]}\n"
+                            f"Provide ONLY a single valid JSON object matching the schema exactly.\n"
+                        )
                     prompt = base_prompt + correction
                     continue
+                    
                 # Retries exhausted: fail this one role/chunk gracefully instead of
                 # crashing the entire PR review. Loudly logged so it's never a
                 # silent, invisible failure — just a bounded one.

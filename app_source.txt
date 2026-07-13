@@ -165,6 +165,7 @@ def compile_dependency_bundle(filepath: str, parsed_diff: dict, symbol_index: di
         print(f"[DEBUG] [Chunker] Context compile complete. Size: {accumulated_chars} chars (~{int(accumulated_chars/4)} tokens).")
     return "\n".join(bundle_lines) if len(bundle_lines) > 1 else ""
 ===== app/config.py =====
+# ===== app/config.py =====
 
 import os
 import json
@@ -189,8 +190,8 @@ DEFAULT_CONFIG = {
     "OLLAMA_HOST": "http://localhost:11434",
     "OLLAMA_NUM_CTX_MIN": 4096,       # Floor for Ollama's context window (num_ctx).
                                       # Ensures prompts aren't silently truncated by small Ollama defaults.
-    "OLLAMA_NUM_CTX_MAX": 8192,       # Ceiling for num_ctx, calibrated for memory constraints with a 14B model.
-    "OLLAMA_NUM_PREDICT": 2048,       # Max output tokens per subagent call to prevent partial JSON truncation.
+    "OLLAMA_NUM_CTX_MAX": 16384,      # Increased ceiling from 8192 to 16384 to handle larger context bundles.
+    "OLLAMA_NUM_PREDICT": 4096,       # Output limit to ensure plenty of room for structured responses.
     "MAX_LOCAL_PARSE_RETRIES": 2,     # Retries for a single subagent call when Ollama returns invalid/truncated JSON.
     "QDRANT_HOST": "http://localhost:6333",
     "EMBEDDING_MODEL": "nomic-embed-text",
@@ -519,6 +520,7 @@ class RateGatekeeper:
             self.call_history.append((time.time(), tokens_used))
             self.daily_count += 1
 ===== app/llm_client.py =====
+# ===== app/llm_client.py =====
 
 import os
 import time
@@ -609,7 +611,7 @@ def get_lines(file: str, start: int, end: int) -> str:
         return f"Error: File '{file}' not found locally or remote parameters missing."
     if get_config().get("LLM_BACKEND") == "ollama":
         return content
-    content_tokens = int(len(content) / 4)
+    content_tokens = int(len(content) / 2.2)
     if _gatekeeper_ref:
         profiler = PipelineProfiler()
         start_gatekeeper_wait = time.perf_counter()
@@ -700,19 +702,35 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     profiler = PipelineProfiler()
     config = get_config()
     ollama_host = config.get("OLLAMA_HOST", "http://localhost:11434")
-    model = os.getenv("LLM_MODEL", "qwen2.5-coder:14b")
+    model = os.getenv("LLM_MODEL", "deepseek-r1:8b")
 
-    # Ollama does NOT automatically infer context window from prompt length.
-    # Set explicit num_ctx options here to prevent silent front/back context truncation.
+    # Read base generation budget.
     num_predict = int(config.get("OLLAMA_NUM_PREDICT", 2048))
-    ctx_floor = int(config.get("OLLAMA_NUM_CTX_MIN", 4096))
-    ctx_ceiling = int(config.get("OLLAMA_NUM_CTX_MAX", 8192))
     
-    estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 4)
+    # Programmatic Self-Healing Override: Bypasses cached VM configuration files
+    # and programmatically upgrades the completion limit to 8192 for DeepSeek-R1 [cl3].
+    if "deepseek-r1" in model.lower():
+        num_predict = max(num_predict, 8192)
+
+    ctx_floor = int(config.get("OLLAMA_NUM_CTX_MIN", 4096))
+    ctx_ceiling = int(config.get("OLLAMA_NUM_CTX_MAX", 16384))
+    
+    # Heuristic update: uses a realistic 2.2 character density to evaluate code prompts accurately [cl3]
+    estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 2.2)
     # Headroom for output generation and safety buffer, aligned to nearest 1024.
     needed_ctx = estimated_input_tokens + num_predict + 512
     needed_ctx = ((needed_ctx // 1024) + 1) * 1024
     num_ctx = max(ctx_floor, min(needed_ctx, ctx_ceiling))
+
+    # Foolproof safety net: if estimated_input_tokens exceeds safe ceiling,
+    # trim payload to prevent 400 Bad Request engine execution crashes [cl3].
+    safe_input_limit = num_ctx - num_predict - 256
+    if estimated_input_tokens > safe_input_limit and safe_input_limit > 0:
+        char_limit = int(safe_input_limit * 2.2)
+        if is_debug_mode():
+            print(f"[DEBUG] [Local LLM Client] Input prompt ({estimated_input_tokens} tokens) exceeds safe limit ({safe_input_limit} tokens). Truncating payload to {char_limit} chars.", flush=True)
+        prompt = prompt[:char_limit] + "\n\n[Prompt truncated to fit context budget]"
+        estimated_input_tokens = int((len(system_instruction) + len(prompt)) / 2.2)
 
     if is_debug_mode() and needed_ctx > ctx_ceiling:
         print(f"[DEBUG] [Local LLM Client] Estimated prompt (~{estimated_input_tokens} tokens) plus output budget "
@@ -733,6 +751,10 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
         "stream": False
     }
     
+    # Ollama 0.31.1 thinking mode configuration. We pass the native think option [cl1.1.2].
+    if "deepseek-r1" in model.lower():
+        payload["think"] = True # Separate thinking channel [cl1.1.2]
+        
     if response_schema is not None:
         raw_schema = response_schema.model_json_schema()
         payload["format"] = simplify_schema_for_local_llm(raw_schema)
@@ -752,7 +774,9 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
     
     for attempt in range(max_retries):
         try:
-            r = requests.post(url, json=payload, timeout=120)
+            # Upgraded HTTP timeout from 120s to 600s (10 minutes) to cleanly accommodate
+            # deep CPU thinking phases without triggering connection timeouts [cl1]
+            r = requests.post(url, json=payload, timeout=600)
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama returned status code {r.status_code}: {r.text}")
             response_data = r.json()
@@ -768,7 +792,13 @@ def call_local_llm(prompt: str, system_instruction: str, response_schema) -> str
                 raise e
     profiler.stop("LLM API Call: Local Network Duration", thread_id=f"api_{tid}")
     
+    # Read thinking trace separately [cl1.1.2]
     content = response_data.get("message", {}).get("content", "")
+    thinking_trace = response_data.get("message", {}).get("thinking", "")
+    
+    if is_debug_mode() and thinking_trace:
+         print(f"\n[DEBUG] [Ollama] Native Thinking Trace Separated:\n{thinking_trace}\n", flush=True)
+         
     done_reason = response_data.get("done_reason")
     
     prompt_tokens = response_data.get("prompt_eval_count", 0)
@@ -824,7 +854,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         pass
     else:
         # Standardize rate limit consumption check across all types of API requests
-        prompt_tokens = int((len(prompt) + len(system_instruction)) / 4)
+        prompt_tokens = int((len(prompt) + len(system_instruction)) / 2.2)
         if _gatekeeper_ref:
             start_gatekeeper_wait = time.perf_counter()
             while True:
@@ -885,6 +915,7 @@ def call_gemini(prompt: str, system_instruction: str, response_schema) -> str:
         
     return response.text
 ===== app/main.py =====
+# ===== /root/code-review-agent/app/main.py =====
 import os
 import sys
 import argparse
@@ -1122,25 +1153,24 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
             
             changed_symbols = get_changed_symbols_in_file(db_path, filepath_abs, modified_lines)
             
+            # Formulate robust context of defined/modified symbols in this file
+            symbols_info = ""
             if changed_symbols:
+                symbols_info = "\n--- AST SYMBOLS DEFINED OR MODIFIED IN THIS FILE ---\n"
                 for sym in changed_symbols:
-                    review_tasks.append({
-                        "type": "symbol",
-                        "filename": filename,
-                        "parsed_diff": parsed_diff,
-                        "sym": sym
-                    })
-            else:
-                chunks = chunk_file_diffs(filename, lang, parsed_diff)
-                for chunk in chunks:
-                    dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
-                    payload = f"{chunk}\n\n{dep_bundle}"
-                    review_tasks.append({
-                        "type": "chunk",
-                        "filename": filename,
-                        "parsed_diff": parsed_diff,
-                        "payload": payload
-                    })
+                    symbols_info += f"- {sym['kind'].upper()}: '{sym['qualified_name']}' (Lines {sym['line_range'][0]}-{sym['line_range'][1]})\n"
+            
+            # Map review pipeline to optimized chunk-centric tasks to avoid serial task explosion [cl1]
+            chunks = chunk_file_diffs(filename, lang, parsed_diff)
+            for chunk in chunks:
+                dep_bundle = compile_dependency_bundle(filename, parsed_diff, symbol_index, dependency_graph, max_hops=dep_hops)
+                payload = f"{chunk}\n{symbols_info}\n{dep_bundle}"
+                review_tasks.append({
+                    "type": "chunk",
+                    "filename": filename,
+                    "parsed_diff": parsed_diff,
+                    "payload": payload
+                })
 
         # 2. Worker task executor
         def execute_review_task(task):
@@ -1153,7 +1183,6 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
                 if task["type"] == "symbol":
                     sym = task["sym"]
                     print(f"[Pipeline] Analysing symbol: '{sym['qualified_name']}' in '{filename}'...", flush=True)
-                    # FIXED: Added parsed_diff, filename, and lang parameters to allow symbol reviews to inspect diff patches.
                     symbol_comments = orchestrate_symbol_review(
                         sym, symbol_index, conventions, cache, db_path,
                         dep_hops=dep_hops, max_escalation_rounds=max_escalation_rounds,
@@ -1169,8 +1198,8 @@ def run_review_pipeline(repo_full_name: str, pr_number: str, dep_hops: int = 1, 
                     )
                     return validate_and_deduplicate_comments(chunk_comments, filename, parsed_diff)
             except Exception as e:
-                # If using local Ollama model, catch exceptions so a single model crash or connection drop
-                # does not discard other successfully evaluated tasks. Gemini propagates for direct debugging.
+                # If using local Ollama model, catch exceptions so a single model crash or connection drop 
+                # does not discard all other successful reviews. Gemini propagates for direct debugging.
                 if backend == "ollama":
                     print(f"[Pipeline] [Ollama] Task on '{filename}' failed ({type(e).__name__}: {e}). Skipping task gracefully.", flush=True)
                     return []
@@ -1358,6 +1387,8 @@ def main():
 if __name__ == "__main__":
     main()
 ===== app/models.py =====
+# ===== app/models.py =====
+
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
 
@@ -1428,44 +1459,20 @@ class SubagentResponse(BaseModel):
         if self.status == "SUCCESS":
             self.context_request = None
         return self
-
-class SubagentResponseOllama(BaseModel):
-    """
-    Ollama-specific schema. Under grammar-constrained decoding (Ollama's 'format' parameter),
-    fields are evaluated in exact order. Forcing 'reasoning' first provides the local model
-    scratchpad space to perform Chain-of-Thought analysis before committing to a status/finding.
-    """
-    reasoning: str = Field(..., description="Step-by-step analysis of the diff chunk against your role's focus areas BEFORE deciding status. Reference concrete line numbers/diff positions and explain what you checked and ruled out. This is scratch space, not shown to the user.")
-    status: Literal["SUCCESS", "NEEDS_CONTEXT"] = Field(..., description="Return status: 'SUCCESS' if review is completed, or 'NEEDS_CONTEXT' if symbols must be resolved.")
-    findings: List[SubagentFinding] = Field(default_factory=list)
-    context_request: Optional[ContextRequest] = Field(None, description="Context requested strictly when status is 'NEEDS_CONTEXT'.")
-    
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_fields(cls, data):
-        if isinstance(data, dict):
-            if "status" in data and isinstance(data["status"], str):
-                val = data["status"].strip().upper()
-                if val in ("SUCCESS", "SUCCESSFUL", "OK", "DONE", "COMPLETE"):
-                    data["status"] = "SUCCESS"
-                elif "NEEDS" in val or "CONTEXT" in val:
-                    data["status"] = "NEEDS_CONTEXT"
-        return data
-
-    @model_validator(mode="after")
-    def enforce_context_by_status(self) -> 'SubagentResponseOllama':
-        if self.status == "SUCCESS":
-            self.context_request = None
-        return self
 ===== app/orchestrator.py =====
+# ===== app/orchestrator.py =====
+
 import json
 import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from app.models import SubagentResponse, SubagentResponseOllama, CodeComment
+from app.models import SubagentResponse, CodeComment
 from app.llm_client import call_gemini, call_local_llm
-from app.prompt_builder import build_subagent_system_instruction, build_subagent_system_instruction_ollama
+from app.prompt_builder import (
+    build_subagent_system_instruction, 
+    build_subagent_system_instruction_ollama
+)
 from app.chunker import get_symbol_signature_or_content
 from app.config import get_config, is_debug_mode
 from app.profiler import PipelineProfiler
@@ -1496,12 +1503,9 @@ SUBAGENT_PROMPTS = {
         "Focus on correctness, edge cases, error handling, thread safety, and memory efficiency. Specifically audit for:\n"
         "1. **Python-Specific Antipatterns & Concurrency:**\n"
         "   - **Mutable Default Arguments:** Never use mutable defaults (e.g., `options={}`) in method/function signatures.\n"
-        "   - **Shared Class/Module-Level Mutable State:** Do not store shared caches or dicts at the class level (e.g., `_explain_json_cache = {}` on the class). "
-        "This is not thread-safe and leaks data across concurrent database connections, queries, or parallel test runs.\n"
-        "   - **Reference Leakage of Cache Content:** Avoid returning cached objects directly by reference if they can be mutated. Callers "
-        "modifying the returned data will pollute subsequent lookups. Clone or return deep copies.\n"
-        "2. **Strict API & Exception Consistency:** Ensure exceptions match existing API conventions. If existing methods raise `ValueError` for invalid parameters, "
-        "new methods must not raise generic `TypeError` or `KeyError` for the same parameter issues.\n"
+        "   - **Shared Class/Module-Level Mutable State:** Do not store shared caches or dicts at the class level (e.g., `_explain_json_cache = {}` on the class). This is not thread-safe and leaks data across concurrent database connections, queries, or parallel test runs.\n"
+        "   - **Reference Leakage of Cache Content:** Avoid returning cached objects directly by reference if they can be mutated. Callers modifying the returned data will pollute subsequent lookups. Clone or return deep copies.\n"
+        "2. **Strict API & Exception Consistency:** Ensure exceptions match existing API conventions. If existing methods raise `ValueError` for invalid parameters, new methods must not raise generic `TypeError` or `KeyError` for the same parameter issues.\n"
         "3. **Execution Logic & Edge Cases:**\n"
         "   - **Early Exits & Validation:** Ensure special-case handlers (like empty/none querysets) do not bypass parameter validation (e.g., check format correctness before returning early).\n"
         "   - **Index/Key Safety:** Guard against assumptions of existence. Never assume `rows[0][0]` or `data[0]` exists without checking if the collection is non-empty.\n"
@@ -1702,38 +1706,70 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
         matches = search_semantic(truncated_query, collection_name, limit=limit)
         semantic_lines = []
         
+        accumulated_semantic_chars = 0
+        # Strict context pruning budget (approx 1500 tokens) to guarantee context bounds
+        semantic_char_budget = 6000 
+        
         for match in matches:
+            if accumulated_semantic_chars >= semantic_char_budget:
+                if is_debug_mode():
+                    print("[DEBUG] [Orchestrator] Proactive semantic context budget exceeded. Truncating further discoveries.")
+                break
+                
             payload_data = match.get("payload", {})
             m_qual = payload_data.get("symbol")
             if m_qual and m_qual in symbol_index:
                 m_meta = symbol_index[m_qual]
+                is_class = m_meta.get("type") == "class"
+                
                 if not cache.contains(m_qual):
-                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=False)
+                    # Force fallback_only=True (signature only) for classes to avoid loading massive class bodies
+                    m_body = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=is_class)
                     cache.add(m_qual, m_meta, m_body)
                 
-                semantic_lines.append(f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}")
+                match_payload = f"\nSemantically Related Pattern Code '{m_qual}':\n{cache.get_body(m_qual)}"
+                
+                if accumulated_semantic_chars + len(match_payload) > semantic_char_budget:
+                    # Fallback to signature only (first line)
+                    m_sig = get_symbol_signature_or_content(m_meta["file_path"], m_meta["line_range"], fallback_only=True)
+                    match_payload = f"\nSemantically Related Pattern Code Signature '{m_qual}':\n{m_sig}"
+                    if accumulated_semantic_chars + len(match_payload) > semantic_char_budget:
+                        continue
+                
+                semantic_lines.append(match_payload)
+                accumulated_semantic_chars += len(match_payload)
                 if is_debug_mode():
                     print(f"[DEBUG] [Orchestrator] Added proactive semantic match: '{m_qual}'")
                 
                 # 1-hop Graph Expansion on the semantic match
                 neighbors = get_symbol_neighbors(db_path, m_qual, max_hops=1)
                 for caller in neighbors["callers"][:2]: # Limit to prevent bloating the token space
+                    if accumulated_semantic_chars >= semantic_char_budget:
+                        break
                     if caller in symbol_index and not cache.contains(caller):
                         n_meta = symbol_index[caller]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(caller, n_meta, n_body)
-                        semantic_lines.append(f"  └─ Caller of match '{caller}': {n_body}")
-                        if is_debug_mode():
-                            print(f"[DEBUG] [Orchestrator]   └─ Added caller neighbor: '{caller}'")
+                        neighbor_payload = f"  └─ Caller of match '{caller}': {n_body}"
+                        if accumulated_semantic_chars + len(neighbor_payload) <= semantic_char_budget:
+                            semantic_lines.append(neighbor_payload)
+                            accumulated_semantic_chars += len(neighbor_payload)
+                            if is_debug_mode():
+                                print(f"[DEBUG] [Orchestrator]   └─ Added caller neighbor: '{caller}'")
                         
                 for callee in neighbors["callees"][:2]: # Limit to prevent bloating the token space
+                    if accumulated_semantic_chars >= semantic_char_budget:
+                        break
                     if callee in symbol_index and not cache.contains(callee):
                         n_meta = symbol_index[callee]
                         n_body = get_symbol_signature_or_content(n_meta["file_path"], n_meta["line_range"], fallback_only=True)
                         cache.add(callee, n_meta, n_body)
-                        semantic_lines.append(f"  └─ Callee of match '{callee}': {n_body}")
-                        if is_debug_mode():
-                            print(f"[DEBUG] [Orchestrator]   └─ Added callee neighbor: '{callee}'")
+                        neighbor_payload = f"  └─ Callee of match '{callee}': {n_body}"
+                        if accumulated_semantic_chars + len(neighbor_payload) <= semantic_char_budget:
+                            semantic_lines.append(neighbor_payload)
+                            accumulated_semantic_chars += len(neighbor_payload)
+                            if is_debug_mode():
+                                print(f"[DEBUG] [Orchestrator]   └─ Added callee neighbor: '{callee}'")
             else:
                 if is_debug_mode() and m_qual:
                     print(f"[DEBUG] [Orchestrator] Semantic match '{m_qual}' not found in active symbol_index.")
@@ -1747,12 +1783,22 @@ def get_proactive_semantic_context(query_text: str, symbol_index: dict, cache: S
 
 def _strip_code_fences(raw_out: str) -> str:
     cleaned = raw_out.strip()
+    
+    # Robustly locate and extract json code blocks
+    # This is extremely important for reasoning models like deepseek-r1 that output <think>...</think> traces first.
+    json_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if json_block_match:
+        return json_block_match.group(1).strip()
+        
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
     if cleaned.startswith("```"):
         cleaned = cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
+        
+    # Erase any leftover thinking traces if they leaked into the stripped string
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned.strip()
 
 def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) -> SubagentResponse:
@@ -1766,69 +1812,79 @@ def run_single_subagent(role: str, chunk_payload: str, conventions_text: str) ->
     
     backend = config.get("LLM_BACKEND", "gemini")
     base_prompt = f"Analyze this diff chunk payload matching your role requirements:\n\n{chunk_payload}"
-    
+
     if backend == "ollama":
         # Ollama-only path: reasoning-first schema, tailored prompt with few-shot
-        # examples, and a bounded retry loop with corrective feedback.
+        # examples, and a bounded retry loop with corrective feedback. A single
+        # local-model hiccup (invalid JSON, truncated generation, a schema-valid
+        # but nonsensical response) must NOT crash the whole PR review — it should
+        # be retried, and if still failing, degrade to an empty SUCCESS result for
+        # just this one role/chunk so every other task still gets reviewed and posted.
+        
+        # Passes the rich, original conventions directly [cl2]
         role_instruction = build_subagent_system_instruction_ollama(role, role_focus, conventions_text, baseline)
         max_retries = int(config.get("MAX_LOCAL_PARSE_RETRIES", 2))
         prompt = base_prompt
         last_error = None
-        last_raw = None
 
         for attempt in range(max_retries + 1):
             try:
-                raw_out = call_local_llm(prompt, role_instruction, SubagentResponseOllama)
-                last_raw = raw_out
+                # Active Instruction Pruning: Switch to a hyper-compact system instruction on retries [cl1].
+                # This drops the input token overhead by ~3,000+ tokens on attempts 2 and 3, completely
+                # preventing compounding context-shrinking failures on subsequent runs [cl1, cl3].
+                active_instruction = role_instruction if attempt == 0 else "Return strictly formatted JSON matching the response schema."
+                
+                # We pass the standard SubagentResponse schema (which lacks the 'reasoning' field)
+                # so that Ollama strictly structures the final content channel to status, findings, context_request [cl1.1.2].
+                raw_out = call_local_llm(prompt, active_instruction, SubagentResponse)
                 cleaned = _strip_code_fences(raw_out)
                 data = json.loads(cleaned)
-                
-                # Parse into the canonical SubagentResponse. The 'reasoning' field
-                # is safely ignored thanks to pydantic's default extra="ignore" strategy.
                 resp = SubagentResponse(**data)
-                
+
                 if is_debug_mode():
                     print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
                     print(raw_out, flush=True)
                     print("-"*98 + "\n", flush=True)
                     print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-                    
+
                 return resp
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
                     print(f"[Orchestrator] [Ollama] Subagent '{role}' returned invalid output on attempt {attempt+1}/{max_retries+1} "
                           f"({type(e).__name__}: {e}). Retrying with corrective feedback.", flush=True)
+                    
+                    # Compact error trace correction payload to prevent compounding token budget inflation [cl1]
                     correction = (
-                        f"\n\n--- YOUR PREVIOUS RESPONSE WAS INVALID ---\n"
-                        f"Error: {e}\n"
-                        f"Previous output (truncated to 1000 chars):\n{(last_raw or '')[:1000]}\n"
-                        f"Fix this. Return ONLY a single valid JSON object matching the schema exactly, "
-                        f"with 'reasoning' as the first key, grounded in the actual diff content below.\n"
+                        f"\n\n--- PREVIOUS RESPONSE FAILED PARSING ---\n"
+                        f"Error: {type(e).__name__}: {str(e)[:150]}\n"
+                        f"Provide ONLY a single valid JSON object matching the schema exactly.\n"
                     )
                     prompt = base_prompt + correction
                     continue
-                
-                # Retries exhausted: degrade gracefully so we don't crash the entire pipeline
+                # Retries exhausted: fail this one role/chunk gracefully instead of
+                # crashing the entire PR review. Loudly logged so it's never a
+                # silent, invisible failure — just a bounded one.
                 print(f"[Orchestrator] [Ollama] Subagent '{role}' failed after {max_retries+1} attempts "
-                      f"({type(e).__name__}: {last_error}). Falling back to empty SUCCESS result.", flush=True)
+                      f"({type(e).__name__}: {last_error}). Falling back to an empty SUCCESS result for this "
+                      f"role/chunk only; other tasks are unaffected.", flush=True)
                 return SubagentResponse(status="SUCCESS", findings=[])
     else:
         role_instruction = build_subagent_system_instruction(role, role_focus, conventions_text, baseline)
         prompt = base_prompt
-        
-        # Propagate exception up directly (No Swallow) to prevent silent failures on Gemini
+
+        # Propagate exception up directly (No Swallow) to prevent silent empty-finding successes
         raw_out = call_gemini(prompt, role_instruction, SubagentResponse)
-        
+
         cleaned = _strip_code_fences(raw_out)
         resp = SubagentResponse(**json.loads(cleaned))
-        
+
         if is_debug_mode():
             print(f"\n" + "-"*35 + f" SUBAGENT RAW RESPONSE: {role} " + "-"*35, flush=True)
             print(raw_out, flush=True)
             print("-"*98 + "\n", flush=True)
             print(f"[DEBUG] [Orchestrator] Subagent '{role}' evaluated successfully. Findings: {len(resp.findings)}", flush=True)
-            
+
         return resp
 
 def run_escalation_routing_llm(escalated_symbols: list, index_candidates: str) -> str:
@@ -2217,6 +2273,7 @@ class PipelineProfiler:
             print(f" - Total Profiled Execution Duration           : {total:7.3f}s")
             print("=" * 77 + "\n")
 ===== app/prompt_builder.py =====
+# ===== app/prompt_builder.py =====
 
 from typing import List
 
@@ -2228,33 +2285,43 @@ def build_subagent_system_instruction(role: str, role_focus: str = "", conventio
 You are a critical code reviewer.
 Role: {role} Auditor.
 {role_focus}
+
 Domain Priorities:
 - P0: Blocker (exploits, crashes, severe leaks, data loss)
 - P1: Must-fix (logical flaws, correctness bugs, API violations, test errors)
 - P2: Suggestion (perf, structural issues, dead code, refactoring)
 - P3: Suggestion (style, minor readability, spelling, cleanups)
-CALIBRATION RULES:
+
+CALIBRATION & QUALITY RULES:
 1. Do NOT upgrade naming, file formatting, or minor style suggestions to P0/P1. Style/refactoring is strictly P2/P3.
 2. If a test is correct but implementation is missing, do NOT assume it fails. Evaluate objectively.
-3. Be highly concise. State the issue and concrete recommendation immediately.
+3. Be highly specific and actionable. Avoid broad, generic, or hand-wavy claims (e.g., "does not validate options" or "should add logging"). Only raise a finding if you can point to a concrete bug, regression, or design pattern violation on that specific line, and describe the exact fix.
+4. MANDATORY LINE FILTERING: You must ONLY generate findings for lines that are newly added or modified (marked with `+` in the diff). Do NOT comment on unchanged context lines (marked with ` `) or baseline behavior. Commenting on unchanged baseline code is a critical error.
+5. LINE POSITION ACCURACY: Double-check the exact `DP:X` value of the line you are commenting on. Do not guess or use a nearby line's DP value. Ensure the method/function name or variable you are commenting on is exactly the one present on the line of that `DP:X`.
+
 NO-FLATTERY CONSTRAINT:
 - NEVER praise code. Return an empty findings list `[]` if no actionable bug/regression exists.
 - If code is fine, return empty `[]` with status "SUCCESS".
+
 MANDATORY ESCALATION PROTOCOL (VERIFICATION BEFORE AUDITING):
 - If the diff deletes or modifies a test case, test assertion, or public interface contract, and you do NOT see the full implementation code of the tested function, you MUST return 'NEEDS_CONTEXT' with the exact symbol name in context_request.
 - Do NOT guess. Verify first. Speculating without verification is a hallucination.
+
 CONTEXT RETRIEVAL RULES (IF STATUS IS 'NEEDS_CONTEXT'):
 1. Use exact simple names for exact symbols (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`) inside 'functions' or 'classes'.
 2. If you want to explore conceptually related patterns, similar logic, or precedents in the codebase but do not know the exact class or function names, you MUST supply natural language descriptions inside the 'semantic_queries' array to query our vector database (e.g., 'JWT token extraction and validation', 'how payment retry limits are configured').
 3. Do NOT request context inside 'why' only. You MUST append search terms inside 'functions', 'classes', or 'semantic_queries' arrays.
 4. Empty arrays mean no context gets retrieved.
+
 DEFINITIONS FOR 'status' FIELD:
 - Use "SUCCESS" if you are confident in your reasoning and findings for the provided diff chunk and do not require additional codebase context (regardless of whether you found bugs/findings or not).
 - Use "NEEDS_CONTEXT" if you cannot confidently determine if there is a bug and require additional definitions, classes, functions, or configurations to be resolved.
 - NEVER return "error", "success" (lowercase), or any other value for status. It must strictly be either "SUCCESS" or "NEEDS_CONTEXT".
+
 IMPORTANT FOR 'context_request' FIELD:
 - If status is "SUCCESS", you MUST set "context_request" to null in your output. Do not fill it with text or queries.
 - If status is "NEEDS_CONTEXT", you MUST populate "context_request" with the exact symbols, classes, functions, or semantic queries you need.
+
 Structure response strictly as a single JSON object matching this schema. No markdown outside:
 {{
   "status": "string ('SUCCESS' or 'NEEDS_CONTEXT')",
@@ -2288,52 +2355,50 @@ def build_subagent_system_instruction_ollama(role: str, role_focus: str = "", co
     Ollama-only variant of build_subagent_system_instruction, tailored to smaller
     locally-hosted models (e.g. qwen2.5-coder) running under grammar-constrained
     structured output.
-    
-    1. Describes the `reasoning` field that must come first in the JSON object
-       (see models.SubagentResponseOllama) and explains it is scratch space for
-       thinking BEFORE committing to a status, not a place to summarize the code.
-    2. Includes two concrete worked examples (SUCCESS-with-finding and
-       NEEDS_CONTEXT) so the model has a clear template to follow.
     """
     instruction = f"""
 You are a critical code reviewer.
 Role: {role} Auditor.
 {role_focus}
+
 Domain Priorities:
 - P0: Blocker (exploits, crashes, severe leaks, data loss)
 - P1: Must-fix (logical flaws, correctness bugs, API violations, test errors)
 - P2: Suggestion (perf, structural issues, dead code, refactoring)
 - P3: Suggestion (style, minor readability, spelling, cleanups)
-CALIBRATION RULES:
+
+CALIBRATION & QUALITY RULES:
 1. Do NOT upgrade naming, file formatting, or minor style suggestions to P0/P1. Style/refactoring is strictly P2/P3.
 2. If a test is correct but implementation is missing, do NOT assume it fails. Evaluate objectively.
-3. Be highly concise. State the issue and concrete recommendation immediately.
+3. Be highly specific and actionable. Avoid broad, generic, or hand-wavy claims (e.g., "does not validate options" or "should add logging"). Only raise a finding if you can point to a concrete bug, regression, or design pattern violation on that specific line, and describe the exact fix.
+4. MANDATORY LINE FILTERING: You must ONLY generate findings for lines that are newly added or modified (marked with `+` in the diff). Do NOT comment on unchanged context lines (marked with ` `) or baseline behavior. Commenting on unchanged baseline code is a critical error.
+5. LINE POSITION ACCURACY: Double-check the exact `DP:X` value of the line you are commenting on. Do not guess or use a nearby line's DP value. Ensure the method/function name or variable you are commenting on is exactly the one present on the line of that `DP:X`.
+
 NO-FLATTERY CONSTRAINT:
 - NEVER praise code. Return an empty findings list `[]` if no actionable bug/regression exists.
 - If code is fine, return empty `[]` with status "SUCCESS".
+
 MANDATORY ESCALATION PROTOCOL (VERIFICATION BEFORE AUDITING):
 - If the diff deletes or modifies a test case, test assertion, or public interface contract, and you do NOT see the full implementation code of the tested function, you MUST return 'NEEDS_CONTEXT' with the exact symbol name in context_request.
 - Do NOT guess. Verify first. Speculating without verification is a hallucination.
+
 CONTEXT RETRIEVAL RULES (IF STATUS IS 'NEEDS_CONTEXT'):
 1. Use exact simple names for exact symbols (e.g. `parse_http_date`, NOT `utils/http.py::parse_http_date`) inside 'functions' or 'classes'.
 2. If you want to explore conceptually related patterns, similar logic, or precedents in the codebase but do not know the exact class or function names, supply natural language descriptions inside the 'semantic_queries' array to query our vector database (e.g., 'JWT token extraction and validation', 'how payment retry limits are configured').
 3. 'functions', 'classes', 'configs', and 'semantic_queries' are ALWAYS required keys. If you have nothing to add to one of them, output an empty array `[]` for it — never omit it.
 4. 'why' must reference the specific items you listed in the arrays above. Never use 'why' as a substitute for populating the arrays.
+
 DEFINITIONS FOR 'status' FIELD:
 - Use "SUCCESS" if you are confident in your reasoning and findings for the provided diff chunk and do not require additional codebase context (regardless of whether you found bugs/findings or not).
 - Use "NEEDS_CONTEXT" if you cannot confidently determine if there is a bug and require additional definitions, classes, functions, or configurations to be resolved.
 - NEVER return "error", "success" (lowercase), or any other value for status. It must strictly be either "SUCCESS" or "NEEDS_CONTEXT".
+
 IMPORTANT FOR 'context_request' FIELD:
 - If status is "SUCCESS", "context_request" MUST be null. Do not fill it with text or queries.
 - If status is "NEEDS_CONTEXT", populate "context_request" with the exact symbols, classes, functions, or semantic queries you need.
-THE 'reasoning' FIELD COMES FIRST IN YOUR OUTPUT. USE IT TO THINK BEFORE YOU DECIDE:
-- Walk through the ACTUAL diff content you were given below, line by line where relevant, against your role's focus areas.
-- Name the specific diff position(s) you are looking at. Say explicitly what you checked and either found wrong or ruled out.
-- Do NOT use 'reasoning' to describe what the code does in general, summarize the file, or restate the prompt. That is not analysis and produces useless output.
-- Everything you conclude in 'reasoning' must be reflected consistently in 'status'/'findings'/'context_request' — do not contradict yourself between fields.
+
 Structure response strictly as a single JSON object matching this schema, in this exact key order. No markdown outside:
 {{
-  "reasoning": "string (your step-by-step analysis of THIS diff chunk, written first)",
   "status": "string ('SUCCESS' or 'NEEDS_CONTEXT')",
   "findings": [
     {{
@@ -2353,9 +2418,9 @@ Structure response strictly as a single JSON object matching this schema, in thi
     "why": "brief reasoning tied to the arrays above"
   }} (must be null if status is 'SUCCESS')
 }}
+
 WORKED EXAMPLE 1 (a real issue was found, no extra context needed):
 {{
-  "reasoning": "Position DP:14 changes the default argument of update() from options=None to options={{}}. This is a mutable default argument — every call that doesn't pass options will share the same dict across invocations, so a caller that mutates it will leak state into later calls. I have the full function body shown, so I don't need to escalate for more context. Nothing else in this chunk raises a concern I can point to specific diff content for.",
   "status": "SUCCESS",
   "findings": [
     {{
@@ -2369,9 +2434,9 @@ WORKED EXAMPLE 1 (a real issue was found, no extra context needed):
   ],
   "context_request": null
 }}
+
 WORKED EXAMPLE 2 (a test assertion changed and the tested function's implementation is not shown, so context is required):
 {{
-  "reasoning": "Position DP:8 deletes the assertion `assert result.status == 'ok'` from test_submit_order and replaces it with `assert result.status in ('ok', 'pending')`. This loosens what the test guarantees. I do not have the implementation of `submit_order` in the context I was given, so per the escalation protocol I cannot verify whether this loosening reflects a real, intentional new code path or is silently masking a regression. I need to see `submit_order` before I can decide.",
   "status": "NEEDS_CONTEXT",
   "findings": [],
   "context_request": {{
@@ -2431,14 +2496,17 @@ def fetch_github_file(owner: str, repo: str, filename: str, token: str) -> str:
         pass
     return ""
 
+# ===== app/repo_checks.py =====
+
 def get_repo_conventions(owner: str = None, repo: str = None, token: str = None) -> str:
-    for name in ["AGENTS.md", "CLAUDE.md"]:
+    # Added singular variations ('agent.md', 'AGENT.md') to seamlessly ingest your local file
+    for name in ["agent.md", "AGENT.md", "AGENTS.md", "CLAUDE.md"]:
         content = read_local_file(name)
         if content:
             return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
             
     if owner and repo and token:
-        for name in ["AGENTS.md", "CLAUDE.md"]:
+        for name in ["agent.md", "AGENT.md", "AGENTS.md", "CLAUDE.md"]:
             content = fetch_github_file(owner, repo, name, token)
             if content:
                 return f"--- REPO CONVENTIONS ({name}) ---\n{content}\n"
@@ -2854,12 +2922,20 @@ def is_identifier_grounded(comment: str, parsed_diff_file: dict) -> bool:
 
 def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_diff_file: dict) -> list:
     valid_comments = []
+    line_to_pos = parsed_diff_file.get("line_to_position", {})
+    added_lines = parsed_diff_file.get("added_lines", {})
     valid_positions = parsed_diff_file.get("valid_positions", set())
+    
+    # Map newly added or modified line numbers to their exact 1-based diff positions (green lines starting with '+')
+    added_positions = {line_to_pos[line_num] for line_num in added_lines if line_num in line_to_pos}
+    # Fallback to general valid positions if added lines positions can't be resolved
+    allowed_positions = added_positions if added_positions else valid_positions
     
     for f in findings:
         f.file = file_path
-        if f.position not in valid_positions:
-            print(f"[Validator] Rejected hallucinated position {f.position} on {file_path}")
+        # Strictly reject comments targeted outside of newly modified or added diff lines
+        if f.position not in allowed_positions:
+            print(f"[Validator] Rejected comment at position {f.position} on {file_path} because it is on an unchanged baseline line.")
             continue
             
         if f.confidence < CONFIDENCE_THRESHOLD:

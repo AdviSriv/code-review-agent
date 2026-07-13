@@ -1,3 +1,5 @@
+# ===== app/models.py =====
+
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
 
@@ -65,35 +67,6 @@ class SubagentResponse(BaseModel):
 
     @model_validator(mode="after")
     def enforce_context_by_status(self) -> 'SubagentResponse':
-        if self.status == "SUCCESS":
-            self.context_request = None
-        return self
-
-class SubagentResponseOllama(BaseModel):
-    """
-    Ollama-specific schema. Under grammar-constrained decoding (Ollama's 'format' parameter),
-    fields are evaluated in exact order. Forcing 'reasoning' first provides the local model
-    scratchpad space to perform Chain-of-Thought analysis before committing to a status/finding.
-    """
-    reasoning: str = Field(..., description="Step-by-step analysis of the diff chunk against your role's focus areas BEFORE deciding status. Reference concrete line numbers/diff positions and explain what you checked and ruled out. This is scratch space, not shown to the user.")
-    status: Literal["SUCCESS", "NEEDS_CONTEXT"] = Field(..., description="Return status: 'SUCCESS' if review is completed, or 'NEEDS_CONTEXT' if symbols must be resolved.")
-    findings: List[SubagentFinding] = Field(default_factory=list)
-    context_request: Optional[ContextRequest] = Field(None, description="Context requested strictly when status is 'NEEDS_CONTEXT'.")
-    
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_fields(cls, data):
-        if isinstance(data, dict):
-            if "status" in data and isinstance(data["status"], str):
-                val = data["status"].strip().upper()
-                if val in ("SUCCESS", "SUCCESSFUL", "OK", "DONE", "COMPLETE"):
-                    data["status"] = "SUCCESS"
-                elif "NEEDS" in val or "CONTEXT" in val:
-                    data["status"] = "NEEDS_CONTEXT"
-        return data
-
-    @model_validator(mode="after")
-    def enforce_context_by_status(self) -> 'SubagentResponseOllama':
         if self.status == "SUCCESS":
             self.context_request = None
         return self
