@@ -46,8 +46,16 @@ def validate_and_deduplicate_comments(findings: list, file_path: str, parsed_dif
         f.file = file_path
         # Strictly reject comments targeted outside of newly modified or added diff lines
         if f.position not in allowed_positions:
-            print(f"[Validator] Rejected comment at position {f.position} on {file_path} because it is on an unchanged baseline line.")
-            continue
+            # The model may have used the raw file line number instead of the DP diff-position
+            # index we asked for. If that line number maps to a valid DP, recover the finding
+            # instead of silently discarding it.
+            remapped = line_to_pos.get(f.position)
+            if remapped is not None and remapped in allowed_positions:
+                print(f"[Validator] Remapped hallucinated line-number position {f.position} -> DP:{remapped} on {file_path}.")
+                f.position = remapped
+            else:
+                print(f"[Validator] Rejected comment at position {f.position} on {file_path} because it is on an unchanged baseline line.")
+                continue
             
         if f.confidence < CONFIDENCE_THRESHOLD:
             continue

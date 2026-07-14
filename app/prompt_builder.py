@@ -21,6 +21,7 @@ CALIBRATION & QUALITY RULES:
 3. Be highly specific and actionable. Avoid broad, generic, or hand-wavy claims (e.g., "does not validate options" or "should add logging"). Only raise a finding if you can point to a concrete bug, regression, or design pattern violation on that specific line, and describe the exact fix.
 4. MANDATORY LINE FILTERING: You must ONLY generate findings for lines that are newly added or modified (marked with `+` in the diff). Do NOT comment on unchanged context lines (marked with ` `) or baseline behavior. Commenting on unchanged baseline code is a critical error.
 5. LINE POSITION ACCURACY: Double-check the exact `DP:X` value of the line you are commenting on. Do not guess or use a nearby line's DP value. Ensure the method/function name or variable you are commenting on is exactly the one present on the line of that `DP:X`.
+6. DO NOT CONFUSE DP WITH THE FILE LINE NUMBER: each diff line is shown as `DP:X +content   [file line N]`. The "position" field must be X (the small DP number), NEVER N (the bracketed file line number). Example of a WRONG position: writing 1499 as "position" when the line reads `DP:4 +... [file line 1499]` — the correct position for that line is 4.
 
 NO-FLATTERY CONSTRAINT:
 - NEVER praise code. Return an empty findings list `[]` if no actionable bug/regression exists.
@@ -102,6 +103,7 @@ CALIBRATION & QUALITY RULES:
 3. Be highly specific and actionable. Avoid broad, generic, or hand-wavy claims (e.g., "does not validate options" or "should add logging"). Only raise a finding if you can point to a concrete bug, regression, or design pattern violation on that specific line, and describe the exact fix.
 4. MANDATORY LINE FILTERING: You must ONLY generate findings for lines that are newly added or modified (marked with `+` in the diff). Do NOT comment on unchanged context lines (marked with ` `) or baseline behavior. Commenting on unchanged baseline code is a critical error.
 5. LINE POSITION ACCURACY: Double-check the exact `DP:X` value of the line you are commenting on. Do not guess or use a nearby line's DP value. Ensure the method/function name or variable you are commenting on is exactly the one present on the line of that `DP:X`.
+6. DO NOT CONFUSE DP WITH THE FILE LINE NUMBER: each diff line is shown as `DP:X +content   [file line N]`. The "position" field must be X (the small DP number), NEVER N (the bracketed file line number). Example of a WRONG position: writing 1499 as "position" when the line reads `DP:4 +... [file line 1499]` — the correct position for that line is 4.
 
 NO-FLATTERY CONSTRAINT:
 - NEVER praise code. Return an empty findings list `[]` if no actionable bug/regression exists.
@@ -201,7 +203,8 @@ def chunk_file_diffs(filepath: str, language: str, parsed_diff: dict) -> List[st
     for idx, hunk in enumerate(hunks):
         lines_repr.append(f"H{idx+1}: {hunk['header']}")
         for diff_pos, char, line_num, content in hunk['lines']:
-            # Shorten format to save valuable token space
+            # DP is the value the model must use for "position" - put it first and
+            # make it visually dominant so it isn't confused with the file line number.
             l_num = line_num if line_num is not None else ""
-            lines_repr.append(f"{l_num}:{char}{content} (DP:{diff_pos})")
+            lines_repr.append(f"DP:{diff_pos} {char}{content}   [file line {l_num}]")
     return ["\n".join(lines_repr)]
